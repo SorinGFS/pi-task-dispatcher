@@ -1,0 +1,42 @@
+{
+  "name": "pi-task-dispatcher",
+  "version": "1.0.0",
+  "description": "Delegate bounded mechanical and engineering tasks to configurable Pi worker models.",
+  "type": "module",
+  "keywords": [
+    "pi-package",
+    "pi-extension",
+    "delegation",
+    "subagent",
+    "model-routing"
+  ],
+  "author": "SorinGFS",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/soringfs/pi-task-dispatcher.git"
+  },
+  "homepage": "https://github.com/soringfs/pi-task-dispatcher#readme",
+  "bugs": {
+    "url": "https://github.com/soringfs/pi-task-dispatcher/issues"
+  },
+  "engines": {
+    "node": ">=22.19.0"
+  },
+  "peerDependencies": {
+    "@earendil-works/pi-coding-agent": "*",
+    "typebox": "*"
+  },
+  "pi": {
+    "extensions": [
+      "./extensions/task-dispatcher.ts"
+    ]
+  },
+  "files": [
+    "extensions",
+    "LICENSE"
+  ],
+  "publishConfig": {
+    "access": "public"
+  }
+}
