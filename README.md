@@ -1,133 +1,124 @@
 # pi-task-dispatcher
 
-Delegate bounded mechanical and engineering subtasks to configurable Pi worker models without replacing the model selected for the main Pi session.
+Delegate bounded tasks from a Pi session to dedicated mechanical and engineering worker models while the selected main model remains in control.
 
-## How it works
+## Features
 
-Your selected Pi model remains the **orchestrator**: it decides whether to delegate, supplies a self-contained task, evaluates the worker report, reviews material changes, and owns the final answer. This package adds two model-only tools:
+- **Two focused worker roles:** route precise execution work to a mechanic model and broader implementation work to an engineer model.
+- **Least-privilege delegation:** every call supplies an exact tool allowlist selected from tools active for the main agent. Workers cannot invoke the delegation tools recursively.
+- **Live progress:** streamed worker text, tool activity, and an elapsed-time heartbeat keep long-running tasks visible.
+- **Recoverable interruption:** approaching time and turn limits request a worker-authored checkpoint. A hard timeout returns a synthetic fallback checkpoint.
+- **Explicit continuation:** a checkpoint never starts another worker automatically. The main agent reviews current state and decides what happens next.
 
-| Tool | Use it when |
+## Worker tools
+
+The package adds two model-only tools to Pi:
+
+| Tool | Intended use |
 | --- | --- |
-| `delegate_mechanical` | The outcome and constraints are precise and the work is bounded, multi-step, and primarily inspection, exact edits, repetitive transformation, commands, retrieval, or verification. Use a direct tool for a single trivial operation. |
-| `delegate_engineering` | A self-contained engineering subtask needs investigation, implementation, debugging, refactoring, testing, review, research, or analysis. Include the outcome, constraints, and acceptance conditions. |
+| `delegate_mechanical` | Bounded multi-step inspection, exact edits, repetitive transformations, commands, retrieval, or verification with precise acceptance conditions. |
+| `delegate_engineering` | Self-contained investigation, implementation, debugging, refactoring, testing, review, research, or analysis. |
 
-Both workers operate in the current workspace and can modify files when their configured tools permit it.
+The main model remains the **orchestrator**. It defines the delegated task, selects the smallest sufficient tool allowlist, evaluates the report, reviews material changes, performs required verification, and owns the final answer.
 
-After the orchestrator selects a delegation tool, its role is routed deterministically to that role's configured `provider/model`. That routing does **not** make a worker's output, changes, or correctness deterministic; treat every worker report as input to review and verification.
+Workers operate in the current workspace and can modify files only when their selected tools permit it. Role routing to the configured `provider/model` is deterministic; worker output and correctness are not. Treat every worker report as input to review rather than proof of completion.
 
 ## Requirements
 
-- Pi 1.0.0 or later
+- Pi 1.0.2 or later
 - Node.js 22.19.0 or later
-- A configured, authenticated Pi model for each worker role you invoke
+- A configured and authenticated Pi model for each worker role you use
 
-## Install
+## Installation
 
-Install the published package for your Pi user configuration:
-
-```sh
-pi install npm:pi-task-dispatcher@1.0.0
-```
-
-For a local checkout, run this from its parent directory:
+Install the package for your Pi user configuration:
 
 ```sh
-pi install ./pi-task-dispatcher
+pi install npm:pi-task-dispatcher
 ```
 
-To register either source in the current project's `.pi/settings.json` instead, add `--local`:
+To install it only for the current project, add `--local`:
 
 ```sh
-pi install npm:pi-task-dispatcher@1.0.0 --local
+pi install npm:pi-task-dispatcher --local
 ```
 
-Project packages load only after that project is trusted. In an already running Pi session, run:
+Project packages load only after the project is trusted. In an active Pi session, load the extension with:
 
 ```text
 /reload
 ```
 
-`/reload` reloads extensions and other discovered resources. The worker configuration below is read again for every delegation.
+## Configuration
 
-## Default workers
+The package works without a configuration file using these defaults:
 
-| Role | Model | Thinking | Timeout | Turn limit |
-| --- | --- | --- | ---: | ---: |
-| Mechanic | `openai-codex/gpt-5.6-luna` | `max` | 300 seconds | 20 |
-| Engineer | `openai-codex/gpt-5.6-terra` | `max` | 900 seconds | 30 |
+| Role | Model | Thinking | Hard timeout | Checkpoint grace | Turn limit |
+| --- | --- | --- | ---: | ---: | ---: |
+| Mechanic | `openai-codex/gpt-5.6-luna` | `max` | 300 seconds | 30 seconds | 20 |
+| Engineer | `openai-codex/gpt-5.6-terra` | `max` | 900 seconds | 45 seconds | 30 |
 
-By default, both workers receive this explicit tool allowlist:
-
-```text
-read,bash,edit,write
-```
-
-`pi-task-dispatcher` provides only these four native Pi tools by default; it does not provide `web_search`, `fetch_content`, `get_search_content`, or `source_check`. If you have the separate `pi-web-access` package installed, you may explicitly add those tools to a role's `tools` array:
+To override them, create `~/.pi/agent/task-dispatcher.json`. If Pi uses a custom agent directory, create `task-dispatcher.json` in that directory instead. Missing roles and fields retain their defaults.
 
 ```json
 {
-  "mechanic": {
-    "tools": ["read", "bash", "edit", "write", "web_search", "fetch_content", "get_search_content", "source_check"]
-  }
-}
-```
-
-## Configure workers
-
-Optionally create `~/.pi/agent/task-dispatcher.json`. If Pi's agent directory is overridden, use `<agent-dir>/task-dispatcher.json` instead. Missing role objects and fields inherit the defaults.
-
-This is a complete valid configuration using the defaults:
-
-```json
-{
-  "version": 1,
   "mechanic": {
     "model": "openai-codex/gpt-5.6-luna",
     "thinking": "max",
-    "tools": [
-      "read",
-      "bash",
-      "edit",
-      "write"
-    ],
     "timeoutSeconds": 300,
+    "checkpointGraceSeconds": 30,
     "maxTurns": 20
   },
   "engineer": {
     "model": "openai-codex/gpt-5.6-terra",
     "thinking": "max",
-    "tools": [
-      "read",
-      "bash",
-      "edit",
-      "write"
-    ],
     "timeoutSeconds": 900,
+    "checkpointGraceSeconds": 45,
     "maxTurns": 30
   }
 }
 ```
 
-| Field | Meaning |
+| Field | Description |
 | --- | --- |
-| `version` | Optional. When present, it must be `1`. |
-| `mechanic`, `engineer` | Optional per-role objects. Each supplied field overrides that role's default. |
-| `model` | A `provider/model` string. Pi verifies that the exact model exists in its registry and has usable authentication before starting the worker. |
-| `thinking` | One of `off`, `minimal`, `low`, `medium`, `high`, `xhigh`, or `max`. |
-| `tools` | A non-empty array of tool names. It replaces, rather than extends, the default allowlist; duplicate names are removed. |
-| `timeoutSeconds` | Positive integer wall-clock limit for the worker process. |
-| `maxTurns` | Positive integer limit for a continuing tool-using worker loop. |
+| `mechanic`, `engineer` | Optional role objects. Each supplied field overrides that role's default. |
+| `model` | Exact `provider/model` identity. The dispatcher verifies model availability and authentication before starting a worker. |
+| `thinking` | `off`, `minimal`, `low`, `medium`, `high`, `xhigh`, or `max`. |
+| `timeoutSeconds` | Positive integer hard wall-clock limit for the worker process. |
+| `checkpointGraceSeconds` | Positive integer period reserved before the hard timeout for a graceful checkpoint. It must be less than `timeoutSeconds`. |
+| `maxTurns` | Positive integer work-turn limit. The dispatcher allows a final checkpoint response after the limit is reached. |
 
-## Isolation, limits, and safety
+Configuration is read for every delegation, so configuration-only changes do not require `/reload`.
 
-Each delegation starts a separate, no-session Pi child process in the current workspace. The worker receives its role prompt, selected model, thinking level, and only the configured `tools` allowlist. The dispatcher does not register either delegation tool inside worker processes, so workers cannot recursively delegate through this package.
+Tool access is deliberately absent from role configuration. Every delegation selects its own exact allowlist from the main agent's currently active tools; `[]` gives the worker no tools. A continuation must select its tools again and does not inherit the previous allowlist.
 
-The parent cancellation signal is propagated to the child. Workers are stopped on timeout, and an ongoing tool-using loop is stopped at its configured turn limit. While a worker runs, its tool activity can be reported as progress. Its final tool result includes the role, model, thinking level, configured tool names, status, turns, duration, exit information, activity, and aggregated usage; non-completed runs are returned as errors with a diagnostic and any available partial report. Reported failure states include configuration, model, and process errors, cancellation, timeout, turn-limit, and incomplete outcomes.
+## Usage
 
-> **Security warning:** Worker process isolation is not a security sandbox. A worker can use every tool in its configured allowlist with the Pi host's permissions in the current environment. Use the smallest practical allowlist and delegate only work you are prepared to authorize.
+Give the main model a bounded objective and let it choose whether delegation is useful. For example:
 
-## Short workflow
+> Use the engineering worker to diagnose the failing parser test. Do not change public APIs. Run the focused test and report the cause, changed files, and test result.
 
-1. Select the normal Pi model that should orchestrate the task.
-2. Give it a bounded request, for example: “Use `delegate_engineering` to diagnose the failing parser test. Do not change public APIs; run the focused test; return the cause, files changed, and test result.”
-3. The orchestrator calls the selected worker tool, receives its report, inspects relevant changes and verification, then produces the final response.
+For tighter control, name the role and allowed tools:
+
+> Delegate this to the mechanic worker with only `read` and `bash`: inspect the generated manifest, run its validation command, and report exact mismatches. Do not modify files.
+
+A direct tool remains preferable for one trivial operation. Delegation is most useful when a self-contained episode would otherwise consume multiple agent turns or produce bulky intermediate output.
+
+## Limits and checkpoints
+
+Each delegation runs in a separate Pi RPC child process with an in-memory, no-session conversation. The worker receives its role prompt, selected model, thinking level, and only the allowlist chosen for that call.
+
+The dispatcher propagates parent cancellation and reports live text and tool activity. Before the hard timeout, it steers the worker to stop at the next safe turn boundary and produce a checkpoint. Reaching the turn limit uses the same checkpoint flow. If the worker cannot settle before the hard deadline, the dispatcher terminates it and reports observed completed and interrupted activity in a fallback checkpoint.
+
+Non-completed results include the stopping reason, available partial worker text, observed activity, and a warning when filesystem effects may remain. The main agent then chooses whether to:
+
+- inspect and continue directly;
+- delegate a bounded continuation with a newly selected allowlist;
+- request user input; or
+- stop and report a limitation.
+
+Continuation is never automatic.
+
+## Security
+
+Worker process separation is **not** a security sandbox. A worker uses its selected tools with the Pi host's permissions in the current environment. Tool availability does not establish task scope, authorization, or safety. Use the smallest practical allowlist and delegate only work you are prepared to authorize and review.

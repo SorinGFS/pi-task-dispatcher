@@ -25,8 +25,8 @@ type WorkerStatus =
 interface WorkerConfig {
 	model: string;
 	thinking: ThinkingLevel;
-	tools: string[];
 	timeoutSeconds: number;
+	checkpointGraceSeconds: number;
 	maxTurns: number;
 }
 
@@ -52,6 +52,21 @@ interface UsageTotals {
 	};
 }
 
+interface WorkerActivity {
+	toolCallId: string;
+	label: string;
+	status: "running" | "completed" | "failed";
+}
+
+interface WorkerCheckpoint {
+	reason: Exclude<WorkerStatus, "running" | "completed">;
+	task: string;
+	lastAssistantText?: string;
+	completedActivities: string[];
+	activeActivities: string[];
+	filesystemEffectsMayRemain: boolean;
+}
+
 interface WorkerDetails {
 	role: Role;
 	status: WorkerStatus;
@@ -64,7 +79,8 @@ interface WorkerDetails {
 	stopReason?: string;
 	diagnostic?: string;
 	stderr?: string;
-	activity: string[];
+	activity: WorkerActivity[];
+	checkpoint?: WorkerCheckpoint;
 }
 
 interface WorkerResult {
@@ -74,45 +90,51 @@ interface WorkerResult {
 }
 
 interface ParsedEvent {
+	id?: string;
 	type?: string;
+	success?: boolean;
+	error?: string;
 	message?: {
 		role?: string;
 		content?: Array<{ type?: string; text?: string; name?: string; arguments?: unknown }>;
-		usage?: Partial<UsageTotals> & { cost?: Partial<UsageTotals["cost"]> };
+		usage?: EventUsage;
 		stopReason?: string;
 		errorMessage?: string;
 	};
+	usage?: EventUsage;
+	assistantMessageEvent?: {
+		type?: string;
+		contentIndex?: number;
+		delta?: string;
+		content?: string;
+	};
+	toolCallId?: string;
 	toolName?: string;
 	args?: unknown;
+	isError?: boolean;
 }
 
-type EventUsage = NonNullable<NonNullable<ParsedEvent["message"]>["usage"]>;
+type EventUsage = Partial<UsageTotals> & { cost?: Partial<UsageTotals["cost"]> };
 
 const CONFIG_PATH = path.join(getAgentDir(), "task-dispatcher.json");
 const WORKER_ENV = "PI_TASK_DISPATCHER_WORKER";
 const RESULT_LIMIT = 24_000;
 const STDERR_LIMIT = 8_000;
-const DEFAULT_TOOLS = [
-	"read",
-	"bash",
-	"edit",
-	"write",
-];
 const THINKING_LEVELS = new Set<ThinkingLevel>(["off", "minimal", "low", "medium", "high", "xhigh", "max"]);
 
 const DEFAULT_CONFIG: DispatcherConfig = {
 	mechanic: {
 		model: "openai-codex/gpt-5.6-luna",
 		thinking: "max",
-		tools: DEFAULT_TOOLS,
 		timeoutSeconds: 300,
+		checkpointGraceSeconds: 30,
 		maxTurns: 20,
 	},
 	engineer: {
 		model: "openai-codex/gpt-5.6-terra",
 		thinking: "max",
-		tools: DEFAULT_TOOLS,
 		timeoutSeconds: 900,
+		checkpointGraceSeconds: 45,
 		maxTurns: 30,
 	},
 };
@@ -155,6 +177,10 @@ const DelegateParams = Type.Object({
 		maxLength: 12_000,
 		description: "A self-contained task with its objective, scope, constraints, and completion checks.",
 	}),
+	tools: Type.Array(Type.String({ minLength: 1 }), {
+		maxItems: 32,
+		description: "The exact worker tool allowlist selected from the main agent's active tools. Use the smallest sufficient set; use an empty array for no tools.",
+	}),
 });
 
 /** Identify plain objects before reading user-controlled JSON configuration fields. */
@@ -164,7 +190,7 @@ function isRecord(value: unknown): value is Record<string, unknown> {
 
 /** Copy defaults so loaded configuration cannot mutate shared role settings. */
 function copyWorkerConfig(config: WorkerConfig): WorkerConfig {
-	return { ...config, tools: [...config.tools] };
+	return { ...config };
 }
 
 /** Validate and merge one role's optional configuration over its package defaults. */
@@ -189,16 +215,8 @@ function parseWorkerConfig(role: Role, value: unknown): WorkerConfig {
 		result.thinking = value.thinking as ThinkingLevel;
 	}
 
-	// Require an explicit non-empty allowlist when tools are overridden.
-	if (value.tools !== undefined) {
-		if (!Array.isArray(value.tools) || value.tools.length === 0 || value.tools.some((tool) => typeof tool !== "string" || !tool.trim())) {
-			throw new Error(`"${role}.tools" must be a non-empty array of tool names`);
-		}
-		result.tools = [...new Set(value.tools as string[])];
-	}
-
 	// Bound worker lifetime settings to positive integers.
-	for (const field of ["timeoutSeconds", "maxTurns"] as const) {
+	for (const field of ["timeoutSeconds", "checkpointGraceSeconds", "maxTurns"] as const) {
 		const candidate = value[field];
 		if (candidate !== undefined) {
 			if (!Number.isInteger(candidate) || (candidate as number) <= 0) {
@@ -206,6 +224,9 @@ function parseWorkerConfig(role: Role, value: unknown): WorkerConfig {
 			}
 			result[field] = candidate as number;
 		}
+	}
+	if (result.checkpointGraceSeconds >= result.timeoutSeconds) {
+		throw new Error(`"${role}.checkpointGraceSeconds" must be less than "${role}.timeoutSeconds"`);
 	}
 
 	return result;
@@ -227,9 +248,6 @@ function loadConfig(): DispatcherConfig {
 		throw new Error(`Cannot parse ${CONFIG_PATH}: ${error instanceof Error ? error.message : String(error)}`);
 	}
 	if (!isRecord(parsed)) throw new Error(`${CONFIG_PATH} must contain a JSON object`);
-	if (parsed.version !== undefined && parsed.version !== 1) {
-		throw new Error(`${CONFIG_PATH} has unsupported version ${String(parsed.version)}`);
-	}
 
 	return {
 		mechanic: parseWorkerConfig("mechanic", parsed.mechanic),
@@ -296,24 +314,45 @@ function formatActivity(name: string, args: unknown): string {
 	return name;
 }
 
+/** Format a stopped worker's observed state for the orchestrator's continuation decision. */
+function formatCheckpoint(checkpoint: WorkerCheckpoint): string {
+	const completed = checkpoint.completedActivities.length > 0 ? checkpoint.completedActivities.join("; ") : "none observed";
+	const active = checkpoint.activeActivities.length > 0 ? checkpoint.activeActivities.join("; ") : "none observed";
+	const text = checkpoint.lastAssistantText ? `\nLast worker text:\n${truncate(checkpoint.lastAssistantText, 4_000)}` : "";
+	return [
+		"Worker checkpoint:",
+		`- Stop reason: ${checkpoint.reason}`,
+		`- Delegated task: ${truncate(checkpoint.task, 2_000)}`,
+		`- Completed tool activity: ${completed}`,
+		`- Active or interrupted tool activity: ${active}`,
+		`- Filesystem effects may remain: ${checkpoint.filesystemEffectsMayRemain ? "yes" : "no"}`,
+		text,
+		"Continuation is not automatic. Inspect material state, then decide whether to continue directly, delegate a bounded continuation with a newly selected tool allowlist, request user input, or stop with a limitation.",
+	].filter(Boolean).join("\n");
+}
+
 /** Run one isolated Pi worker through its full tool-using agent loop. */
 async function runWorker(
 	role: Role,
 	task: string,
 	config: WorkerConfig,
+	tools: string[],
 	cwd: string,
 	signal: AbortSignal | undefined,
 	onUpdate: ((result: { content: Array<{ type: "text"; text: string }>; details: WorkerDetails }) => void) | undefined,
 ): Promise<WorkerResult> {
 	const startedAt = Date.now();
 	const usage = emptyUsage();
-	const activity: string[] = [];
+	const activity: WorkerActivity[] = [];
+	const activeActivity = new Map<string, WorkerActivity>();
+	const streamingText = new Map<number, string>();
 	let turns = 0;
 	let finalOutput = "";
 	let stopReason: string | undefined;
 	let modelError: string | undefined;
 	let stderr = "";
 	let forcedStatus: WorkerStatus | undefined;
+	let checkpointRequestedReason: "timeout" | "turn_limit" | undefined;
 	let processError: string | undefined;
 
 	// Keep role instructions out of the command line and remove them after the worker exits.
@@ -325,18 +364,15 @@ async function runWorker(
 
 		const args = [
 			"--mode",
-			"json",
-			"-p",
+			"rpc",
 			"--no-session",
 			"--model",
 			config.model,
 			"--thinking",
 			config.thinking,
-			"--tools",
-			config.tools.join(","),
+			...(tools.length > 0 ? ["--tools", tools.join(",")] : ["--no-tools"]),
 			"--append-system-prompt",
 			promptPath,
-			`Delegated ${role} task:\n${task}`,
 		];
 
 		const exitCode = await new Promise<number | null>((resolve) => {
@@ -344,7 +380,7 @@ async function runWorker(
 			const child = spawn(invocation.command, invocation.args, {
 				cwd,
 				shell: false,
-				stdio: ["ignore", "pipe", "pipe"],
+				stdio: ["pipe", "pipe", "pipe"],
 				env: { ...process.env, [WORKER_ENV]: role },
 			});
 			let stdoutBuffer = "";
@@ -364,7 +400,41 @@ async function runWorker(
 				}, 5_000);
 			};
 
-			// Retain in-flight usage while treating completed messages as authoritative.
+			// Ask the worker to stop at the next safe turn boundary and author its handoff report.
+			const requestCheckpoint = (reason: "timeout" | "turn_limit") => {
+				if (checkpointRequestedReason || settled || child.stdin.writableEnded) return;
+				checkpointRequestedReason = reason;
+				const message =
+					reason === "timeout"
+						? "The delegation time limit is approaching. Stop starting new work. At the next safe boundary, return a concise checkpoint with completed work, files changed, checks run, current state, interrupted work, and unresolved items. Do not continue implementation."
+						: "The delegation turn limit has been reached. After current tool calls finish, stop work and return a concise checkpoint with completed work, files changed, checks run, current state, interrupted work, and unresolved items. Do not continue implementation.";
+				child.stdin.write(`${JSON.stringify({ id: `checkpoint-${reason}`, type: "steer", message })}\n`);
+			};
+
+			let lastProgressAt = 0;
+			const currentStreamingText = () =>
+				[...streamingText.entries()].sort(([left], [right]) => left - right).map(([, text]) => text).join("\n").trim();
+			const emitProgress = (text: string, force = false) => {
+				const now = Date.now();
+				if (!force && now - lastProgressAt < 250) return;
+				lastProgressAt = now;
+				onUpdate?.({
+					content: [{ type: "text", text }],
+					details: {
+						role,
+						status: "running",
+						model: config.model,
+						thinking: config.thinking,
+						tools,
+						turns,
+						durationMs: now - startedAt,
+						exitCode: null,
+						activity: activity.map((item) => ({ ...item })),
+					},
+				});
+			};
+
+			// Reduce the documented JSON event stream into live progress and a recoverable checkpoint.
 			const processLine = (line: string) => {
 				if (!line.trim()) return;
 				let event: ParsedEvent;
@@ -373,10 +443,65 @@ async function runWorker(
 				} catch {
 					return;
 				}
-				if (event.type === "message_update") {
-					if (event.message?.usage) unfinishedUsage = event.message.usage;
+
+				// Fail promptly when RPC rejects the initial prompt instead of waiting for the wall-clock limit.
+				if (event.type === "response" && event.id === "delegated-task" && event.success === false) {
+					processError = event.error || "Pi rejected the delegated RPC prompt.";
+					stopChild("process_error");
 					return;
 				}
+
+				if (event.type === "agent_settled") {
+					if (checkpointRequestedReason && !forcedStatus) forcedStatus = checkpointRequestedReason;
+					if (!child.stdin.writableEnded) child.stdin.end();
+					return;
+				}
+
+				if (event.type === "message_update") {
+					if (event.usage) unfinishedUsage = event.usage;
+					const update = event.assistantMessageEvent;
+					if (typeof update?.contentIndex === "number") {
+						if (update.type === "text_start") streamingText.set(update.contentIndex, "");
+						if (update.type === "text_delta" && update.delta) {
+							streamingText.set(update.contentIndex, (streamingText.get(update.contentIndex) ?? "") + update.delta);
+							emitProgress(`${role}: ${truncate(currentStreamingText(), 500) || "working..."}`);
+						}
+						if (update.type === "text_end" && update.content !== undefined) {
+							streamingText.set(update.contentIndex, update.content);
+							emitProgress(`${role}: ${truncate(currentStreamingText(), 500) || "working..."}`, true);
+						}
+					}
+					return;
+				}
+
+				if (event.type === "tool_execution_start" && event.toolCallId && event.toolName) {
+					const item: WorkerActivity = {
+						toolCallId: event.toolCallId,
+						label: formatActivity(event.toolName, event.args),
+						status: "running",
+					};
+					activity.push(item);
+					activeActivity.set(item.toolCallId, item);
+					emitProgress(`${role}: running ${item.label}`, true);
+					return;
+				}
+
+				if (event.type === "tool_execution_update" && event.toolCallId) {
+					const item = activeActivity.get(event.toolCallId);
+					if (item) emitProgress(`${role}: running ${item.label}`);
+					return;
+				}
+
+				if (event.type === "tool_execution_end" && event.toolCallId) {
+					const item = activeActivity.get(event.toolCallId);
+					if (item) {
+						item.status = event.isError ? "failed" : "completed";
+						activeActivity.delete(event.toolCallId);
+						emitProgress(`${role}: ${item.status} ${item.label}`, true);
+					}
+					return;
+				}
+
 				if (event.type !== "message_end" || event.message?.role !== "assistant") return;
 
 				turns++;
@@ -384,32 +509,22 @@ async function runWorker(
 				modelError = event.message.errorMessage ?? modelError;
 				addUsage(usage, event.message.usage ?? unfinishedUsage);
 				unfinishedUsage = undefined;
-
-				// Preserve the latest final text and surface worker tool activity as progress.
-				for (const part of event.message.content ?? []) {
-					if (part.type === "text" && part.text) finalOutput = part.text;
-					if (part.type === "toolCall" && part.name) {
-						const label = formatActivity(part.name, part.arguments);
-						activity.push(label);
-						onUpdate?.({
-							content: [{ type: "text", text: `${role}: ${label}` }],
-							details: {
-								role,
-								status: "running",
-								model: config.model,
-								thinking: config.thinking,
-								tools: config.tools,
-								turns,
-								durationMs: Date.now() - startedAt,
-								exitCode: null,
-								activity: [...activity],
-							},
-						});
-					}
-				}
-
-				if (turns >= config.maxTurns && stopReason === "toolUse") stopChild("turn_limit");
+				const completedText = (event.message.content ?? [])
+					.filter((part) => part.type === "text" && part.text)
+					.map((part) => part.text as string)
+					.join("\n")
+					.trim();
+				if (completedText) finalOutput = completedText;
+				streamingText.clear();
+				if (turns >= config.maxTurns && stopReason === "toolUse") requestCheckpoint("turn_limit");
 			};
+
+			// Keep long model and tool waits visibly alive even when the child emits no stream event.
+			const heartbeat = setInterval(() => {
+				const running = [...activeActivity.values()].map((item) => item.label).join("; ");
+				const elapsedSeconds = Math.floor((Date.now() - startedAt) / 1_000);
+				emitProgress(`${role}: ${running ? `running ${running}` : "working"} (${elapsedSeconds}s)`, true);
+			}, 1_000);
 
 			// Stream-decode UTF-8 before splitting complete JSONL records, retaining a trailing fragment.
 			child.stdout.on("data", (chunk) => {
@@ -425,9 +540,13 @@ async function runWorker(
 			child.on("error", (error) => {
 				processError = error.message;
 			});
+			child.stdin.on("error", (error) => {
+				processError ??= error.message;
+			});
 			// Flush decoder state and charge at most one unfinished streamed assistant response.
 			child.on("close", (code) => {
 				settled = true;
+				clearInterval(heartbeat);
 				if (forceKillTimer) clearTimeout(forceKillTimer);
 				stdoutBuffer += stdoutDecoder.decode();
 				stderr = truncate(stderr + stderrDecoder.decode(), STDERR_LIMIT);
@@ -436,8 +555,18 @@ async function runWorker(
 				resolve(code);
 			});
 
+			// Start the RPC run after all stream handlers are ready.
+			child.stdin.write(
+				`${JSON.stringify({ id: "delegated-task", type: "prompt", message: `Delegated ${role} task:\n${task}` })}\n`,
+			);
+
+			const checkpointLeadMs = (config.timeoutSeconds - config.checkpointGraceSeconds) * 1_000;
+			const checkpointTimer = setTimeout(() => requestCheckpoint("timeout"), checkpointLeadMs);
 			const timeout = setTimeout(() => stopChild("timeout"), config.timeoutSeconds * 1_000);
-			child.once("close", () => clearTimeout(timeout));
+			child.once("close", () => {
+				clearTimeout(checkpointTimer);
+				clearTimeout(timeout);
+			});
 
 			// Propagate cancellation from the parent Pi turn to the worker process.
 			if (signal) {
@@ -456,14 +585,23 @@ async function runWorker(
 		else if (stopReason && stopReason !== "stop") status = "incomplete";
 		else if (!finalOutput.trim()) status = "incomplete";
 
-		// Put failure context ahead of output emitted before the worker reached a completed state.
-		const partialOutput = finalOutput.trim();
+		// Put failure context and a synthetic checkpoint ahead of any partial worker report.
+		const streamedOutput = [...streamingText.entries()]
+			.sort(([left], [right]) => left - right)
+			.map(([, text]) => text)
+			.join("\n")
+			.trim();
+		const partialOutput = finalOutput.trim() || streamedOutput;
 		const stderrOutput = stderr.trim();
 		const statusDiagnostic =
 			status === "timeout"
-				? `Worker timed out after ${config.timeoutSeconds} seconds.`
+				? checkpointRequestedReason === "timeout" && exitCode === 0
+					? `Worker reached the time limit and returned a checkpoint during the ${config.checkpointGraceSeconds}-second grace period.`
+					: `Worker timed out after ${config.timeoutSeconds} seconds.`
 				: status === "turn_limit"
-					? `Worker reached the configured ${config.maxTurns}-turn limit.`
+					? checkpointRequestedReason === "turn_limit" && exitCode === 0
+						? `Worker reached the configured ${config.maxTurns}-turn limit and returned a checkpoint.`
+						: `Worker reached the configured ${config.maxTurns}-turn limit.`
 					: status === "aborted"
 						? "Worker was aborted."
 						: status === "process_error"
@@ -473,10 +611,22 @@ async function runWorker(
 								: `Worker did not complete${stopReason ? ` (stop reason: ${stopReason})` : ""}.`;
 		const diagnostic =
 			status === "completed" ? undefined : modelError || processError || stderrOutput || statusDiagnostic;
-		const output =
-			status !== "completed" && diagnostic
-				? `${diagnostic}${partialOutput ? `\n\n${partialOutput}` : ""}`
-				: partialOutput || stderrOutput || "The worker produced no final report.";
+		const checkpoint: WorkerCheckpoint | undefined =
+			status === "completed"
+				? undefined
+				: {
+						reason: status,
+						task,
+						lastAssistantText: partialOutput || undefined,
+						completedActivities: activity
+							.filter((item) => item.status !== "running")
+							.map((item) => `${item.status}: ${item.label}`),
+						activeActivities: activity.filter((item) => item.status === "running").map((item) => item.label),
+						filesystemEffectsMayRemain: activity.length > 0,
+					};
+		const output = checkpoint
+			? `${diagnostic ?? statusDiagnostic}\n\n${formatCheckpoint(checkpoint)}`
+			: partialOutput || stderrOutput || "The worker produced no final report.";
 		return {
 			output: truncate(output, RESULT_LIMIT),
 			details: {
@@ -484,7 +634,7 @@ async function runWorker(
 				status,
 				model: config.model,
 				thinking: config.thinking,
-				tools: config.tools,
+				tools,
 				turns,
 				durationMs: Date.now() - startedAt,
 				exitCode,
@@ -492,6 +642,7 @@ async function runWorker(
 				diagnostic,
 				stderr: stderrOutput || undefined,
 				activity,
+				checkpoint,
 			},
 			usage,
 		};
@@ -512,6 +663,20 @@ function validateModel(config: WorkerConfig, ctx: ExtensionToolContext): void {
 	}
 }
 
+/** Validate the exact per-delegation allowlist against tools active for the orchestrator. */
+function validateDelegatedTools(requested: string[], pi: ExtensionAPI): string[] {
+	const tools = [...new Set(requested.map((tool) => tool.trim()).filter(Boolean))];
+	const forbidden = new Set(["delegate_mechanical", "delegate_engineering"]);
+	const recursive = tools.filter((tool) => forbidden.has(tool));
+	if (recursive.length > 0) throw new Error(`Delegation tools cannot be delegated recursively: ${recursive.join(", ")}`);
+	const active = new Set(pi.getActiveTools());
+	const unavailable = tools.filter((tool) => !active.has(tool));
+	if (unavailable.length > 0) {
+		throw new Error(`Requested worker tools are not active for the main agent: ${unavailable.join(", ")}`);
+	}
+	return tools;
+}
+
 /** Register one role-specific public tool over the shared worker executor. */
 function registerDelegate(pi: ExtensionAPI, role: Role): void {
 	const toolName = role === "mechanic" ? "delegate_mechanical" : "delegate_engineering";
@@ -524,7 +689,9 @@ function registerDelegate(pi: ExtensionAPI, role: Role): void {
 			role === "mechanic"
 				? "Use delegate_mechanical for bounded multi-step execution with precise desired results; give it a self-contained contract and integrate its report."
 				: "Use delegate_engineering broadly for self-contained investigation or production work; give it the outcome, constraints, and acceptance conditions, then integrate its report.",
+			"Select the smallest exact worker tool allowlist from tools active for the main agent; tool availability does not establish scope or authorization.",
 			"Delegation results are worker reports, not proof of correctness; inspect material changes and retain responsibility for the final answer.",
+			"When a worker returns a checkpoint, inspect current state and decide whether to continue directly, delegate a bounded continuation with a newly selected tool allowlist, request user input, or stop with a limitation. Continuation is never automatic.",
 		],
 		parameters: DelegateParams,
 		exposure: "model-only",
@@ -538,9 +705,11 @@ function registerDelegate(pi: ExtensionAPI, role: Role): void {
 
 		async execute(_toolCallId, params, signal, onUpdate, ctx) {
 			let config: WorkerConfig;
+			let tools: string[];
 			try {
 				config = loadConfig()[role];
 				validateModel(config, ctx);
+				tools = validateDelegatedTools(params.tools, pi);
 			} catch (error) {
 				const message = error instanceof Error ? error.message : String(error);
 				return {
@@ -550,7 +719,7 @@ function registerDelegate(pi: ExtensionAPI, role: Role): void {
 						status: "configuration_error" as const,
 						model: "",
 						thinking: "off" as const,
-						tools: [],
+						tools: params.tools,
 						turns: 0,
 						durationMs: 0,
 						exitCode: null,
@@ -561,7 +730,7 @@ function registerDelegate(pi: ExtensionAPI, role: Role): void {
 				};
 			}
 
-			const result = await runWorker(role, params.task, config, ctx.cwd, signal, onUpdate);
+			const result = await runWorker(role, params.task, config, tools, ctx.cwd, signal, onUpdate);
 			const heading = `${role} worker ${result.details.status} via ${result.details.model} (${result.details.thinking})`;
 			return {
 				content: [{ type: "text", text: `${heading}\n\n${result.output}` }],
