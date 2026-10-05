@@ -1,124 +1,192 @@
 # pi-task-dispatcher
 
-Delegate bounded tasks from a Pi session to dedicated mechanical and engineering worker models while the selected main model remains in control.
+Supervised mechanical and engineering delegations for Pi.
+
+Each delegation runs in an isolated, in-memory Pi RPC session. After every cohesive tool batch, a worker-side gate stops execution at a safe boundary and returns a bounded state report. The manager can then inspect the result and explicitly continue, revise, compact, checkpoint, cancel, or take over.
 
 ## Features
 
-- **Two focused worker roles:** route precise execution work to a mechanic model and broader implementation work to an engineer model.
-- **Least-privilege delegation:** every call supplies an exact tool allowlist selected from tools active for the main agent. Workers cannot invoke the delegation tools recursively.
-- **Live progress:** streamed worker text, tool activity, and an elapsed-time heartbeat keep long-running tasks visible.
-- **Recoverable interruption:** approaching time and turn limits request a worker-authored checkpoint. A hard timeout returns a synthetic fallback checkpoint.
-- **Explicit continuation:** a checkpoint never starts another worker automatically. The main agent reviews current state and decides what happens next.
-
-## Worker tools
-
-The package adds two model-only tools to Pi:
-
-| Tool | Intended use |
-| --- | --- |
-| `delegate_mechanical` | Bounded multi-step inspection, exact edits, repetitive transformations, commands, retrieval, or verification with precise acceptance conditions. |
-| `delegate_engineering` | Self-contained investigation, implementation, debugging, refactoring, testing, review, research, or analysis. |
-
-The main model remains the **orchestrator**. It defines the delegated task, selects the smallest sufficient tool allowlist, evaluates the report, reviews material changes, performs required verification, and owns the final answer.
-
-Workers operate in the current workspace and can modify files only when their selected tools permit it. Role routing to the configured `provider/model` is deterministic; worker output and correctness are not. Treat every worker report as input to review rather than proof of completion.
+- **Two worker roles:** mechanical execution and broader engineering work.
+- **Enforced supervision:** a private parent-child IPC gate calls `ctx.abort()` after persisted tool results; pausing does not depend on the worker following a prompt.
+- **Explicit control:** continue, revise, recalculate, compact, checkpoint, cancel, or take over.
+- **Resumable context:** continuation uses the same in-memory worker session and completed tool results.
+- **Least privilege:** every start selects an exact Pi built-in worker-tool allowlist; delegation tools and unrelated discovered extensions are unavailable to the worker.
+- **Model agnostic:** both roles inherit Pi's active model and thinking level unless an explicit role override is configured.
+- **Formula-owned budgets:** the manager supplies semantic workload units, while the dispatcher calculates turn and time ceilings from workload, role, and delegated-model limits.
+- **Context insight:** boundary reports include worker context usage, compactions, turns, elapsed time, action counts, and recommendations.
+- **Recoverable reports:** the complete action ledger and worker text remain in structured tool details; bounded model-facing text retains recent actions plus both the beginning and ending of long reports.
+- **Deterministic UI:** tool renderers display task, current activity, elapsed time, context pressure, and terminal success/failure colors. A compact paused-state line appears in Pi's footer.
 
 ## Requirements
 
-- Pi 1.0.2 or later
+- Pi 1.0.3 or later
 - Node.js 22.19.0 or later
-- A configured and authenticated Pi model for each worker role you use
+- One active, authenticated Pi model; optional role-specific models must also be available and authenticated
+
+The supervision gate requires the parent Pi process and child Pi CLI to run under Node.js with an inherited IPC channel. The dispatcher fails closed when that boundary cannot be established; it does not fall back to prompt-only supervision. Worker processes disable ordinary extension discovery and load only the generated supervision gate.
 
 ## Installation
 
-Install the package for your Pi user configuration:
+Install the published package for the current Pi user:
 
 ```sh
 pi install npm:pi-task-dispatcher
 ```
 
-To install it only for the current project, add `--local`:
+## Tools
 
-```sh
-pi install npm:pi-task-dispatcher --local
-```
+| Tool | Responsibility |
+| --- | --- |
+| `delegate_mechanical` | Start a supervised mechanic delegation. |
+| `delegate_engineering` | Start a supervised engineer delegation. |
+| `delegate_control` | Apply one explicit manager decision to a paused delegation. |
+| `delegate_status` | Recover the current or most recent state without changing it. |
 
-Project packages load only after the project is trusted. In an active Pi session, load the extension with:
+Only one live delegation is currently permitted. A terminal delegation may be inspected until a new one replaces it.
 
-```text
-/reload
-```
+## Starting a delegation
 
-## Configuration
+Both role tools require:
 
-The package works without a configuration file using these defaults:
-
-| Role | Model | Thinking | Hard timeout | Checkpoint grace | Turn limit |
-| --- | --- | --- | ---: | ---: | ---: |
-| Mechanic | `openai-codex/gpt-5.6-luna` | `max` | 300 seconds | 30 seconds | 20 |
-| Engineer | `openai-codex/gpt-5.6-terra` | `max` | 900 seconds | 45 seconds | 30 |
-
-To override them, create `~/.pi/agent/task-dispatcher.json`. If Pi uses a custom agent directory, create `task-dispatcher.json` in that directory instead. Missing roles and fields retain their defaults.
+- `task`: a self-contained objective, scope, constraints, and acceptance checks;
+- `tools`: the smallest exact allowlist selected from Pi's built-in tools and active for the main agent;
+- `workload`: semantic estimates used by the deterministic budget formula.
 
 ```json
 {
-  "mechanic": {
-    "model": "openai-codex/gpt-5.6-luna",
-    "thinking": "max",
-    "timeoutSeconds": 300,
-    "checkpointGraceSeconds": 30,
-    "maxTurns": 20
-  },
-  "engineer": {
-    "model": "openai-codex/gpt-5.6-terra",
-    "thinking": "max",
-    "timeoutSeconds": 900,
-    "checkpointGraceSeconds": 45,
-    "maxTurns": 30
+  "task": "Inspect the parser cache, correct its invalidation, and run the focused tests.",
+  "tools": ["read", "edit", "bash"],
+  "workload": {
+    "investigationUnits": 3,
+    "changeUnits": 2,
+    "verificationUnits": 2,
+    "expectedLongRunningSeconds": 60
   }
 }
 ```
 
-| Field | Description |
+A workload unit is intentionally semantic:
+
+- `investigationUnits`: cohesive components or evidence groups to inspect;
+- `changeUnits`: related edit groups;
+- `verificationUnits`: focused check or test groups;
+- `expectedLongRunningSeconds`: additional expected command time.
+
+At least one investigation, change, or verification unit is required.
+
+Isolated workers accept `read`, `bash`, `powershell`, `edit`, `write`, `grep`, `find`, and `ls` when the selected tools are also active in the main Pi session. Extension tools are not supported because the child disables extension discovery.
+
+The current formula derives planned work turns from those units, applies a role factor and a bounded scale based on the selected delegated model's own context window, reserves two additional turns for synthesis or recovery, then derives active execution time from calculated turns plus expected long-running time. Administrative ceilings always win. Formula inputs and results are returned in every state report so they can be reviewed and recalculated. Time spent paused for manager deliberation does not consume the active execution budget.
+
+## Safe action boundaries
+
+A worker run proceeds as follows:
+
+1. Pi produces one assistant response.
+2. Its complete tool-call batch runs and tool results are persisted.
+3. The worker-only gate reports the boundary through private IPC.
+4. The gate aborts the automatic next worker turn.
+5. The RPC run settles while the child process and in-memory context remain alive.
+6. The delegation tool returns the new state to the manager.
+
+An action batch can contain parallel tool calls from one worker response. Already-running tools are allowed to finish. The boundary prevents another productive model turn from starting without a manager decision.
+
+## Controlling a paused delegation
+
+`delegate_control` accepts these actions:
+
+| Action | Effect |
 | --- | --- |
-| `mechanic`, `engineer` | Optional role objects. Each supplied field overrides that role's default. |
-| `model` | Exact `provider/model` identity. The dispatcher verifies model availability and authentication before starting a worker. |
-| `thinking` | `off`, `minimal`, `low`, `medium`, `high`, `xhigh`, or `max`. |
-| `timeoutSeconds` | Positive integer hard wall-clock limit for the worker process. |
-| `checkpointGraceSeconds` | Positive integer period reserved before the hard timeout for a graceful checkpoint. It must be less than `timeoutSeconds`. |
-| `maxTurns` | Positive integer work-turn limit. The dispatcher allows a final checkpoint response after the limit is reached. |
+| `continue` | Resume from completed results. `actionBatches` may lease 1–10 batches before returning. |
+| `revise` | Add controlling instructions, then resume. |
+| `recalculate` | Supply remaining semantic workload and extend the current ceilings from observed turns and active execution time without running the worker. |
+| `compact` | Compact the idle worker's own context and return refreshed state. |
+| `take_over` | Stop the delegation externally and transfer remaining work to the manager. |
+| `checkpoint` | Stop externally and preserve a synthetic checkpoint from observed state. |
+| `cancel` | Stop externally and close the job. |
 
-Configuration is read for every delegation, so configuration-only changes do not require `/reload`.
+Example:
 
-Tool access is deliberately absent from role configuration. Every delegation selects its own exact allowlist from the main agent's currently active tools; `[]` gives the worker no tools. A continuation must select its tools again and does not inherit the previous allowlist.
+```json
+{
+  "jobId": "engineer-2",
+  "action": "continue",
+  "actionBatches": 2
+}
+```
 
-## Usage
+The dispatcher enforces takeover, cancellation, budget exhaustion, no-progress policy, and process cleanup. These actions do not depend on worker cooperation.
 
-Give the main model a bounded objective and let it choose whether delegation is useful. For example:
+## State reports and screen output
 
-> Use the engineering worker to diagnose the failing parser test. Do not change public APIs. Run the focused test and report the cause, changed files, and test result.
+A paused result contains:
 
-For tighter control, name the role and allowed tools:
+- a session-local sequential identity such as `engineer-2`, plus role, model, and status;
+- the delegated task and live command or tool activity while execution is running;
+- boundary sequence and current phase;
+- completed, failed, and potentially mutating action counts;
+- recent bounded activity labels;
+- active elapsed time and turns against calculated budgets;
+- context tokens, context window, percentage, and compaction counts;
+- a recommended next decision;
+- bounded worker text, if any.
 
-> Delegate this to the mechanic worker with only `read` and `bash`: inspect the generated manifest, run its validation command, and report exact mismatches. Do not modify files.
+The TUI renders the same structured state as a compact block. Expanding the tool result reveals bounded worker text. The complete action ledger and worker text remain in result details for state reconstruction rather than being discarded by display truncation.
 
-A direct tool remains preferable for one trivial operation. Delegation is most useful when a self-contained episode would otherwise consume multiple agent turns or produce bulky intermediate output.
+When paused, one unindented footer status appears below Pi's primary report. It shows the identity, active elapsed time, last activity, and context as percentage/window—for example, `10.3%/32k context`. The percentage and window both come from that delegation's selected model and live worker-session statistics, not from the main model.
 
-## Limits and checkpoints
+## Worker compaction
 
-Each delegation runs in a separate Pi RPC child process with an in-memory, no-session conversation. The worker receives its role prompt, selected model, thinking level, and only the allowlist chosen for that call.
+The dispatcher explicitly enables automatic compaction in every worker session. Pi's automatic compaction remains the overflow safety mechanism.
 
-The dispatcher propagates parent cancellation and reports live text and tool activity. Before the hard timeout, it steers the worker to stop at the next safe turn boundary and produce a checkpoint. Reaching the turn limit uses the same checkpoint flow. If the worker cannot settle before the hard deadline, the dispatcher terminates it and reports observed completed and interrupted activity in a fallback checkpoint.
+The dispatcher also:
 
-Non-completed results include the stopping reason, available partial worker text, observed activity, and a warning when filesystem effects may remain. The main agent then chooses whether to:
+- observes compaction lifecycle events;
+- accounts for reported compaction usage;
+- queries `get_session_stats` at safe boundaries;
+- recommends proactive compaction when context usage reaches the current policy threshold;
+- permits explicit worker compaction only while paused.
 
-- inspect and continue directly;
-- delegate a bounded continuation with a newly selected allowlist;
-- request user input; or
-- stop and report a limitation.
+Worker compaction is independent from compaction of the main Pi conversation.
 
-Continuation is never automatic.
+## Configuration
 
-## Security
+The optional configuration file is `task-dispatcher.json` in Pi's agent directory.
 
-Worker process separation is **not** a security sandbox. A worker uses its selected tools with the Pi host's permissions in the current environment. Tool availability does not establish task scope, authorization, or safety. Use the smallest practical allowlist and delegate only work you are prepared to authorize and review.
+```json
+{
+  "policy": {
+    "absoluteMaxTurns": 96,
+    "absoluteMaxSeconds": 7200,
+    "pausedLeaseSeconds": 1800,
+    "noProgressSeconds": 600
+  }
+}
+```
+
+Configuration is read for every new delegation. By default, both roles inherit the manager's active model and thinking level, so installation assumes no particular provider or model access. A role may optionally override `model` with `"provider/model"`, `thinking`, or both. Policy values are administrative failsafes, not ordinary task budgets.
+
+Version 3 intentionally ignores the version 2 fields `maxTurns`, `timeoutSeconds`, and `checkpointGraceSeconds`. Remove them from local configuration after migration.
+
+## Lifecycle and cleanup
+
+- A parent-operation abort stops the active worker stage.
+- A paused lease eventually closes an abandoned worker.
+- Session shutdown or extension reload disposes the child and runtime-controlled temporary files.
+- Worker process failures reject pending RPC operations and produce a failed state.
+- Worker role instructions and the supervision gate exist only in a runtime-controlled temporary directory.
+- The worker uses `--no-session`; no worker session file is persisted.
+
+Process separation is not a security sandbox. Worker tools execute with the Pi host's operating-system permissions. Tool availability does not establish task scope or authorization.
+
+## Development checks
+
+```sh
+npm run check
+npm run test:gate
+```
+
+`check` runs static release invariants and deterministic fake-RPC lifecycle and renderer scenarios. The fake child verifies pause/resume, usage deltas, full action-ledger retention, intercepted prompts, missing-boundary failure, fail-closed timeouts, pre-aborted operations, partial argument rendering, stable repeated rendering, and manager-state transitions without a model request.
+
+`test:gate` performs a small live model integration check with the active parent model exported by Pi through `PI_PROVIDER`, `PI_MODEL`, and `PI_REASONING_LEVEL`, falling back to Pi's configured default when those values are unavailable; it contains no provider or model assumption. Optional `PI_TASK_DISPATCHER_GATE_MODEL` and `PI_TASK_DISPATCHER_GATE_THINKING` overrides are available for explicit test matrices. The probe verifies that the private gate pauses after a read batch and that the same in-memory child can subsequently complete. It requires configured credentials and therefore is not a hermetic unit test.
+
