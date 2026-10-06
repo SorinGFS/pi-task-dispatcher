@@ -42,18 +42,23 @@ try {
 	const handlers = new Map();
 	const pi = {
 		registerTool(tool) { tools.set(tool.name, tool); },
-		getActiveTools() { return ["read", "bash", "edit", "write"]; },
+		getActiveTools() { return ["read", "bash", "edit", "write", "codemode"]; },
 		on(event, handler) { handlers.set(event, handler); },
 	};
 	register(pi);
 
 	const activeModel = { provider: "fake-provider", id: "active-model", contextWindow: 272_000, maxTokens: 128_000 };
+	const statusUpdates = [];
 	const context = {
 		cwd: projectRoot,
-		hasUI: false,
+		hasUI: true,
 		model: activeModel,
 		thinkingLevel: "medium",
-		ui: { setWidget() {}, setStatus() {} },
+		ui: {
+			theme: { fg(_color, text) { return text; } },
+			setWidget() {},
+			setStatus(key, text) { statusUpdates.push({ key, text }); },
+		},
 		modelRegistry: {
 			find(provider, id) { return { provider, id, contextWindow: 272_000, maxTokens: 128_000 }; },
 			hasConfiguredAuth() { return true; },
@@ -61,8 +66,10 @@ try {
 	};
 	const workload = { investigationUnits: 1, changeUnits: 0, verificationUnits: 1, expectedLongRunningSeconds: 0 };
 	const start = tools.get("delegate_engineering");
+	const designerStart = tools.get("delegate_designer");
 	const control = tools.get("delegate_control");
-	assert(start && control, "Expected supervised tools to register.");
+	assert(start && designerStart && control, "Expected supervised tools to register.");
+	assert(tools.has("delegate_mechanical") && tools.has("delegate_assistant"), "Expected every worker role to register.");
 	const theme = { fg(_color, text) { return text; }, bold(text) { return text; } };
 	let rendererInvalidations = 0;
 	const renderContext = { args: {}, state: {}, invalidate() { rendererInvalidations++; }, cwd: projectRoot };
@@ -83,7 +90,9 @@ try {
 	assert.equal(result.usage.output, 3);
 	assert.equal(result.usage.totalTokens, 16);
 	const partialRender = start.renderResult(result, { expanded: false, isPartial: true }, theme, renderContext).render(100).join("\n");
+	assert.match(partialRender, /Last: read package\.json/);
 	assert.match(partialRender, /Elapsed:/);
+	assert.equal(statusUpdates.at(-1)?.text, "engineer-1 · 11.0%/1k • active-model • medium");
 	const resultComponent = start.renderResult(result, { expanded: false, isPartial: false }, theme, renderContext);
 	const firstRender = resultComponent.render(100).join("\n");
 	assert.match(firstRender, /Took:/);
@@ -109,9 +118,65 @@ try {
 	assert.equal(result.details.workerText, "deterministic worker complete");
 	assert.equal(result.usage.input, 5, "Continuation must return only newly observed usage.");
 	assert.equal(result.usage.totalTokens, 8);
+	assert.equal(statusUpdates.at(-1)?.text, "engineer-1 · 12.0%/1k • active-model • medium");
+	assert(!statusUpdates.some((update) => update.text === undefined), "Worker status must remain visible after it first appears.");
 	control.renderResult(result, { expanded: false, isPartial: false }, theme, managerRenderContext).render(100);
 	assert.match(managerCall.render(100).join("\n"), /manager: engineer-1 → completed/);
 	assert.doesNotMatch(managerCall.render(100).join("\n"), /continue\/completed/);
+
+	// The designer must load only the selected built-in codemode extension and account nested usage once.
+	await writeFile(configPath, JSON.stringify({ designer: { model: "media-provider/media-model", thinking: "high" } }), "utf8");
+	process.env.PI_TASK_DISPATCHER_FAKE_SCENARIO = "codemode";
+	result = await designerStart.execute("start-designer", { task: "fake image job", tools: ["read", "codemode"], workload }, undefined, undefined, context);
+	assert.equal(result.isError, false);
+	assert.equal(result.details.status, "paused");
+	assert.equal(result.details.role, "designer");
+	assert.equal(result.details.model, "media-provider/media-model");
+	assert.equal(result.details.thinking, "high");
+	assert.equal(result.details.actionLedger.length, 2);
+	assert.equal(result.details.actionCounts.mutations, 1);
+	assert.equal(result.details.recentActions.at(-1).toolName, "codemode");
+	assert.deepEqual(result.details.recentActions.at(-1).mediaOutputs, [{ mimeType: "image/png", bytes: 4 }]);
+	assert.match(result.details.recentActions.at(-1).label, /1 image/);
+	assert.doesNotMatch(JSON.stringify(result.details), /ZmFrZQ==/, "Snapshots must not retain base64 media payloads.");
+	assert.equal(result.usage.input, 20, "Each nested and parent execution must contribute its own pre-merge usage exactly once.");
+	assert.equal(result.usage.output, 6);
+	assert.equal(result.usage.totalTokens, 26);
+	assert.equal(
+		statusUpdates.at(-1)?.text,
+		"designer-2 · 11.0%/1k • media-model • high | engineer-1 · 12.0%/1k • active-model • medium",
+		"Starting another role must retain the previous role's footer status.",
+	);
+	result = await control.execute(
+		"continue-designer",
+		{ jobId: result.details.jobId, action: "continue", actionBatches: 1 },
+		undefined,
+		undefined,
+		context,
+	);
+	assert.equal(result.details.status, "completed");
+	assert.match(statusUpdates.at(-1)?.text ?? "", /designer-2.*\|.*engineer-1/);
+	await writeFile(configPath, "{}\n", "utf8");
+
+	// A tool-free output-limit stop must preserve the session so the manager can recover the report.
+	process.env.PI_TASK_DISPATCHER_FAKE_SCENARIO = "length";
+	result = await start.execute("start-length", { task: "fake truncated job", tools: ["read"], workload }, undefined, undefined, context);
+	assert.equal(result.isError, false);
+	assert.equal(result.details.status, "paused");
+	assert.equal(result.details.turns, 1);
+	assert.equal(result.details.workerText, "truncated worker report");
+	assert.match(result.details.phase, /output limit/i);
+	assert.match(result.details.recommendation, /continue to recover/i);
+	result = await control.execute(
+		"continue-length",
+		{ jobId: result.details.jobId, action: "continue", actionBatches: 1 },
+		undefined,
+		undefined,
+		context,
+	);
+	assert.equal(result.isError, false);
+	assert.equal(result.details.status, "completed");
+	assert.equal(result.details.workerText, "deterministic worker complete");
 
 	// A handled prompt starts no agent run and must fail promptly rather than waiting for settlement.
 	process.env.PI_TASK_DISPATCHER_FAKE_SCENARIO = "handled";

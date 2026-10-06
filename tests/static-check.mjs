@@ -21,8 +21,13 @@ if (!source.includes("let model = ctx.model")) throw new Error("Role defaults no
 
 // Require the supervised protocol and its externally enforced gate in every v3 candidate.
 for (const required of [
+	"delegate_mechanical",
+	"delegate_assistant",
+	"delegate_engineering",
+	"delegate_designer",
 	"delegate_control",
 	"delegate_status",
+	"builtin:codemode",
 	"task_dispatcher_boundary",
 	"without an enforced IPC boundary",
 	"--no-extensions",

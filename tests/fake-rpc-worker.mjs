@@ -50,18 +50,60 @@ readline.createInterface({ input: process.stdin }).on("line", async (line) => {
 	if (markerPath) await appendFile(markerPath, `${promptCount}\n`, "utf8");
 	if (scenario === "timeout") return;
 	if (scenario === "handled") {
-		send({ type: "response", id: command.id, command: command.type, success: true, disposition: "handled" });
+		send({ type: "response", id: command.id, command: command.type, success: true, data: { disposition: "handled" } });
 		return;
 	}
 
-	send({ type: "response", id: command.id, command: command.type, success: true, disposition: "started" });
+	if (scenario === "codemode" && promptCount === 1) {
+		const toolsIndex = process.argv.indexOf("--tools");
+		const selectedTools = toolsIndex >= 0 ? process.argv[toolsIndex + 1]?.split(",") ?? [] : [];
+		const extensionValues = process.argv.flatMap((argument, index) => argument === "--extension" ? [process.argv[index + 1]] : []);
+		if (!selectedTools.includes("codemode") || !extensionValues.includes("builtin:codemode")) {
+			send({ type: "response", id: command.id, command: command.type, success: false, error: "codemode was not isolated and loaded" });
+			return;
+		}
+	}
+
+	send({ type: "response", id: command.id, command: command.type, success: true, data: { disposition: "started" } });
+	if (scenario === "length" && promptCount === 1) {
+		send({
+			type: "message_end",
+			message: {
+				role: "assistant",
+				stopReason: "length",
+				content: [{ type: "text", text: "truncated worker report" }],
+				usage: usage(7, 4),
+			},
+		});
+		send({ type: "agent_settled" });
+		return;
+	}
 	if (promptCount === 1) {
 		send({
 			type: "message_end",
 			message: { role: "assistant", stopReason: "toolUse", content: [], usage: usage(10, 2) },
 		});
-		send({ type: "tool_execution_start", toolCallId: "fake-read-1", toolName: "read", args: { path: "package.json" } });
-		send({ type: "tool_execution_end", toolCallId: "fake-read-1", toolName: "read", isError: false, result: { usage: usage(3, 1) } });
+		if (scenario === "codemode") {
+			send({ type: "tool_execution_start", toolCallId: "fake-codemode-1", toolName: "codemode", args: "return image" });
+			send({ type: "tool_execution_start", toolCallId: "fake-read-nested", parentToolCallId: "fake-codemode-1", toolName: "read", args: { path: "reference.png" } });
+			send({ type: "tool_execution_end", toolCallId: "fake-read-nested", parentToolCallId: "fake-codemode-1", toolName: "read", isError: false, result: { usage: usage(3, 1) } });
+			send({
+				type: "tool_execution_end",
+				toolCallId: "fake-codemode-1",
+				toolName: "codemode",
+				isError: false,
+				result: {
+					content: [
+						{ type: "text", text: "generated image retained in runtime temporary storage" },
+						{ type: "image", data: "ZmFrZQ==", mimeType: "image/png" },
+					],
+					usage: usage(7, 3),
+				},
+			});
+		} else {
+			send({ type: "tool_execution_start", toolCallId: "fake-read-1", toolName: "read", args: { path: "package.json" } });
+			send({ type: "tool_execution_end", toolCallId: "fake-read-1", toolName: "read", isError: false, result: { usage: usage(3, 1) } });
+		}
 		if (scenario === "missing-boundary") {
 			send({
 				type: "message_end",

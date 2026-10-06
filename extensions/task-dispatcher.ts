@@ -14,7 +14,7 @@ import {
 import { Text } from "@earendil-works/pi-tui";
 import { Type } from "typebox";
 
-type Role = "mechanic" | "engineer";
+type Role = "mechanic" | "assistant" | "engineer" | "designer";
 type ThinkingLevel = "off" | "minimal" | "low" | "medium" | "high" | "xhigh" | "max";
 type JobStatus =
 	| "starting"
@@ -44,11 +44,9 @@ interface DispatcherPolicy {
 	noProgressSeconds: number;
 }
 
-interface DispatcherConfig {
-	mechanic: WorkerRoleConfig;
-	engineer: WorkerRoleConfig;
+type DispatcherConfig = Record<Role, WorkerRoleConfig> & {
 	policy: DispatcherPolicy;
-}
+};
 
 interface Workload {
 	investigationUnits: number;
@@ -82,6 +80,11 @@ interface UsageTotals {
 	};
 }
 
+interface WorkerMediaOutput {
+	mimeType: string;
+	bytes: number;
+}
+
 interface WorkerAction {
 	sequence: number;
 	toolCallId: string;
@@ -91,6 +94,9 @@ interface WorkerAction {
 	status: "running" | "completed" | "failed";
 	startedAt: number;
 	endedAt?: number;
+	completionSequence?: number;
+	parentToolCallId?: string;
+	mediaOutputs?: WorkerMediaOutput[];
 }
 
 interface ContextMetrics {
@@ -149,6 +155,7 @@ interface ParsedEvent {
 	errorMessage?: string;
 	willRetry?: boolean;
 	result?: {
+		content?: Array<{ type?: string; text?: string; data?: string; mimeType?: string }>;
 		usage?: EventUsage;
 		estimatedTokensAfter?: number;
 	};
@@ -168,6 +175,7 @@ interface ParsedEvent {
 	};
 	toolCallId?: string;
 	toolName?: string;
+	parentToolCallId?: string;
 	args?: unknown;
 	isError?: boolean;
 }
@@ -189,12 +197,15 @@ const WIDGET_ID = "pi-task-dispatcher-worker";
 const MODEL_TEXT_LIMIT = 5_000;
 const STDERR_LIMIT = 16_000;
 const THINKING_LEVELS = new Set<ThinkingLevel>(["off", "minimal", "low", "medium", "high", "xhigh", "max"]);
-const MUTATING_TOOLS = new Set(["edit", "write", "bash", "powershell"]);
-const ISOLATED_WORKER_TOOLS = new Set(["read", "bash", "powershell", "edit", "write", "grep", "find", "ls"]);
+const ROLES: Role[] = ["mechanic", "assistant", "engineer", "designer"];
+const MUTATING_TOOLS = new Set(["edit", "write", "bash", "powershell", "codemode"]);
+const ISOLATED_WORKER_TOOLS = new Set(["read", "bash", "powershell", "edit", "write", "grep", "find", "ls", "codemode"]);
 
 const DEFAULT_CONFIG: DispatcherConfig = {
 	mechanic: {},
+	assistant: {},
 	engineer: {},
+	designer: {},
 	policy: {
 		absoluteMaxTurns: 96,
 		absoluteMaxSeconds: 7_200,
@@ -206,13 +217,33 @@ const DEFAULT_CONFIG: DispatcherConfig = {
 const ROLE_PROMPTS: Record<Role, string> = {
 	mechanic: `You are the mechanical worker in a supervised delegated Pi task.
 Complete only the supplied bounded objective with the available tools. Work in cohesive tool batches. After each tool batch the dispatcher pauses you externally so the manager can inspect state. On continuation, use the existing tool results and continue without repeating completed work. Finish with a concise report containing status, files changed, checks, and unresolved items.`,
+	assistant: `You are the assistant worker in a supervised delegated Pi task.
+Complete only the supplied bounded, low-complexity objective. Apply limited interpretation or synthesis, but do not assume manager responsibilities, expand scope, or make architectural decisions. Work in cohesive tool batches. After each tool batch the dispatcher pauses you externally so the manager can inspect state. On continuation, use existing results without repeating completed work. Finish with a concise report containing outcome, evidence, changes, checks, and unresolved items.`,
 	engineer: `You are the engineering worker in a supervised delegated Pi task.
 Own only the supplied subtask while the caller retains integration responsibility. Investigate, implement, and verify in cohesive tool batches. After each tool batch the dispatcher pauses you externally so the manager can inspect state. On continuation, use the existing tool results and continue without repeating completed work. Finish with a concise report containing outcome, files changed, checks, decisions, and unresolved items.`,
+	designer: `You are the media designer worker in a supervised delegated Pi task.
+Own only the supplied image, video, audio, or media-asset objective while the caller retains integration responsibility. When available, use read for visual inputs, codemode image models for image generation or editing, and explicitly available command-line programs such as ffmpeg for media processing. Verify required executables before depending on them. Treat codemode-generated images as temporary until you copy the selected result to the requested workspace destination and verify it. Preserve source assets unless the task explicitly requires replacement. Work in cohesive tool batches; the dispatcher pauses after each batch. Finish with a concise report containing outputs, source files affected, tools used, checks, and unresolved items.`,
 };
 
 const ROLE_DESCRIPTIONS: Record<Role, string> = {
-	mechanic: "Start a supervised mechanical delegation. It pauses after each completed tool batch so the manager can inspect, continue, compact, revise, checkpoint, cancel, or take over.",
-	engineer: "Start a supervised engineering delegation. It pauses after each completed tool batch so the manager can inspect, continue, compact, revise, checkpoint, cancel, or take over.",
+	mechanic: "Start a supervised mechanical delegation for prescribed execution with a known method and result.",
+	assistant: "Start a supervised assistant delegation for bounded, low-complexity interpretation, synthesis, or routine updates.",
+	engineer: "Start a supervised engineering delegation for uncertain, cross-component, or implementation-intensive work.",
+	designer: "Start a supervised media-design delegation for image generation or editing and command-line image, video, or audio processing.",
+};
+
+const ROLE_TOOL_NAMES: Record<Role, string> = {
+	mechanic: "delegate_mechanical",
+	assistant: "delegate_assistant",
+	engineer: "delegate_engineering",
+	designer: "delegate_designer",
+};
+
+const ROLE_LABELS: Record<Role, string> = {
+	mechanic: "↗ mechanic",
+	assistant: "↗ assistant",
+	engineer: "↗ engineer",
+	designer: "↗ designer",
 };
 
 const WorkloadSchema = Type.Object({
@@ -349,11 +380,11 @@ function calculateBudget(
 		Math.ceil(workload.investigationUnits * 1.25) +
 		Math.ceil(workload.changeUnits * 1.5) +
 		workload.verificationUnits;
-	const roleFactor = role === "engineer" ? 1.25 : 1;
+	const roleFactor = role === "engineer" || role === "designer" ? 1.25 : 1;
 	const contextScale = Math.max(0.75, Math.min(1.5, contextWindow / 400_000));
 	// Reserve two turns for synthesis or recovery after the planned tool-producing work.
 	const turns = Math.min(policy.absoluteMaxTurns, Math.max(6, Math.ceil(plannedTurns * roleFactor * contextScale) + 2));
-	const secondsPerTurn = role === "engineer" ? 50 : 30;
+	const secondsPerTurn = role === "engineer" || role === "designer" ? 50 : 30;
 	const seconds = Math.min(
 		policy.absoluteMaxSeconds,
 		Math.max(120, 30 + turns * secondsPerTurn + workload.expectedLongRunningSeconds),
@@ -365,13 +396,15 @@ function calculateBudget(
 function loadConfig(): DispatcherConfig {
 	const result: DispatcherConfig = {
 		mechanic: { ...DEFAULT_CONFIG.mechanic },
+		assistant: { ...DEFAULT_CONFIG.assistant },
 		engineer: { ...DEFAULT_CONFIG.engineer },
+		designer: { ...DEFAULT_CONFIG.designer },
 		policy: { ...DEFAULT_CONFIG.policy },
 	};
 	if (!fs.existsSync(CONFIG_PATH)) return result;
 	const parsed = JSON.parse(fs.readFileSync(CONFIG_PATH, "utf8")) as unknown;
 	if (!isRecord(parsed)) throw new Error(`${CONFIG_PATH} must contain an object`);
-	for (const role of ["mechanic", "engineer"] as const) {
+	for (const role of ROLES) {
 		const value = parsed[role];
 		if (value === undefined) continue;
 		if (!isRecord(value)) throw new Error(`"${role}" must be an object`);
@@ -486,6 +519,7 @@ class WorkerJob {
 	private stderr = "";
 	private requestSequence = 0;
 	private actionSequence = 0;
+	private completionSequence = 0;
 	private activeActions = new Map<string, WorkerAction>();
 	private pendingRequests = new Map<string, { resolve: (event: ParsedEvent) => void; reject: (error: Error) => void }>();
 	private settleWaiter: { resolve: () => void; reject: (error: Error) => void } | undefined;
@@ -543,6 +577,7 @@ class WorkerJob {
 			"--thinking", this.thinking,
 			...(this.tools.length > 0 ? ["--tools", this.tools.join(",")] : ["--no-tools"]),
 			"--append-system-prompt", rolePromptPath,
+			...(this.tools.includes("codemode") ? ["--extension", "builtin:codemode"] : []),
 			"--extension", gatePath,
 		];
 		const invocation = getDirectPiInvocation(args);
@@ -649,6 +684,12 @@ class WorkerJob {
 		const completed = this.actions.filter((action) => action.status === "completed").length;
 		const failed = this.actions.filter((action) => action.status === "failed").length;
 		const currentAction = [...this.actions].reverse().find((action) => action.status === "running");
+		// Present completed actions in actual completion order while retaining start order in the ledger.
+		const recentActions = this.actions
+			.filter((action) => action.status !== "running")
+			.sort((left, right) => (left.completionSequence ?? 0) - (right.completionSequence ?? 0))
+			.slice(-8)
+			.map((action) => ({ ...action, mediaOutputs: action.mediaOutputs?.map((output) => ({ ...output })) }));
 		return {
 			jobId: this.id,
 			role: this.role,
@@ -670,8 +711,8 @@ class WorkerJob {
 				failed,
 				mutations: this.actions.filter((action) => action.mutating).length,
 			},
-			recentActions: this.actions.slice(-8).map((action) => ({ ...action })),
-			actionLedger: this.actions.map((action) => ({ ...action })),
+			recentActions,
+			actionLedger: this.actions.map((action) => ({ ...action, mediaOutputs: action.mediaOutputs?.map((output) => ({ ...output })) })),
 			workerText: this.workerText,
 			workerTextDisplay: display.text,
 			workerTextTruncated: display.truncated,
@@ -789,6 +830,7 @@ class WorkerJob {
 				mutating: MUTATING_TOOLS.has(event.toolName),
 				status: "running",
 				startedAt: Date.now(),
+				parentToolCallId: event.parentToolCallId,
 			};
 			this.actions.push(action);
 			this.activeActions.set(action.toolCallId, action);
@@ -800,8 +842,19 @@ class WorkerJob {
 			if (action) {
 				action.status = event.isError ? "failed" : "completed";
 				action.endedAt = Date.now();
+				action.completionSequence = ++this.completionSequence;
+				const mediaOutputs = (event.result?.content ?? []).flatMap((part) =>
+					part.type === "image" && typeof part.mimeType === "string" && typeof part.data === "string"
+						? [{ mimeType: part.mimeType, bytes: Buffer.from(part.data, "base64").length }]
+						: []
+				);
+				if (mediaOutputs.length > 0) {
+					action.mediaOutputs = mediaOutputs;
+					action.label += ` · ${mediaOutputs.length} image${mediaOutputs.length === 1 ? "" : "s"}`;
+				}
 				this.activeActions.delete(event.toolCallId);
 			}
+			// Execution-end events carry each call's own usage before Pi merges nested usage into persistence.
 			addUsage(this.usage, event.result?.usage);
 			this.emitProgress();
 			return;
@@ -843,6 +896,7 @@ class WorkerJob {
 			this.recommendation = "wait for boundary";
 			onProgress(this.snapshot());
 			this.boundaryObserved = false;
+			this.lastStopReason = undefined;
 			this.settleWaiter = undefined;
 			const settled = new Promise<void>((resolve, reject) => {
 				this.settleWaiter = { resolve, reject };
@@ -863,7 +917,10 @@ class WorkerJob {
 				const operation = (async () => {
 					const prompt = await this.request("prompt", { type: "prompt", message }, this.operationTimeout(30_000));
 					if (!prompt.success) throw new Error(prompt.error || "Worker rejected the prompt.");
-					if (prompt.disposition === "handled") throw new Error("Worker prompt was intercepted by an input handler; no agent run started.");
+					if (!isRecord(prompt.data) || typeof prompt.data.disposition !== "string") {
+						throw new Error("Worker prompt response omitted its disposition.");
+					}
+					if (prompt.data.disposition === "handled") throw new Error("Worker prompt was intercepted by an input handler; no agent run started.");
 					await settled;
 				})();
 				await this.waitForSettlement(operation);
@@ -881,9 +938,17 @@ class WorkerJob {
 				this.commitActiveElapsed();
 			}
 			await this.refreshStats();
+			// Classify tool-free settlement while preserving output-limit responses for recovery.
 			if (!this.boundaryObserved) {
-				this.status = this.lastStopReason === "error" ? "failed" : "completed";
-				this.phase = this.status === "completed" ? "worker completed" : "worker model error";
+				if (this.lastStopReason === "length") {
+					this.status = "paused";
+					this.phase = "worker response reached its output limit";
+					this.recommendation = "continue to recover the truncated response, revise, checkpoint, cancel, or take over";
+					this.schedulePausedLease();
+					return this.snapshot();
+				}
+				this.status = this.lastStopReason === "stop" ? "completed" : "failed";
+				this.phase = this.status === "completed" ? "worker completed" : `worker stopped with ${this.lastStopReason ?? "no final reason"}`;
 				this.recommendation = this.status === "completed" ? "review and integrate" : "inspect failure";
 				const snapshot = this.snapshot();
 				await this.dispose();
@@ -1051,6 +1116,7 @@ class WorkerJob {
 
 let activeJob: WorkerJob | undefined;
 let lastSnapshot: WorkerSnapshot | undefined;
+const latestRoleSnapshots = new Map<Role, WorkerSnapshot>();
 const reportedUsage = new Map<string, UsageTotals>();
 
 /** Resolve role overrides against the active parent model without assuming provider availability. */
@@ -1075,18 +1141,18 @@ function resolveWorkerConfig(config: WorkerRoleConfig, ctx: ExtensionToolContext
 	};
 }
 
-/** Restrict delegations to active, non-recursive built-in tools selected by the manager. */
+/** Restrict delegations to active, non-recursive isolated-worker tools selected by the manager. */
 function validateDelegatedTools(requested: string[], pi: ExtensionAPI): string[] {
 	const tools = [...new Set(requested.map((tool) => tool.trim()).filter(Boolean))];
-	const forbidden = new Set(["delegate_mechanical", "delegate_engineering", "delegate_control", "delegate_status"]);
+	const forbidden = new Set([...Object.values(ROLE_TOOL_NAMES), "delegate_control", "delegate_status"]);
 	const recursive = tools.filter((tool) => forbidden.has(tool));
 	if (recursive.length > 0) throw new Error(`Delegation tools cannot be delegated: ${recursive.join(", ")}`);
 	const active = new Set(pi.getActiveTools());
 	const unavailable = tools.filter((tool) => !active.has(tool));
 	if (unavailable.length > 0) throw new Error(`Delegated tools are not active for the manager: ${unavailable.join(", ")}`);
-	const extensionTools = tools.filter((tool) => !ISOLATED_WORKER_TOOLS.has(tool));
-	if (extensionTools.length > 0) {
-		throw new Error(`Isolated workers accept Pi built-in tools only; extension tools require a future explicit extension mapping: ${extensionTools.join(", ")}`);
+	const unsupportedTools = tools.filter((tool) => !ISOLATED_WORKER_TOOLS.has(tool));
+	if (unsupportedTools.length > 0) {
+		throw new Error(`Isolated workers do not support these tools: ${unsupportedTools.join(", ")}`);
 	}
 	return tools;
 }
@@ -1132,18 +1198,22 @@ function formatSnapshot(snapshot: WorkerSnapshot): string {
 	].filter(Boolean).join("\n");
 }
 
-/** Keep one unindented paused-state line in Pi's footer, below its primary report. */
+/** Keep one unindented footer line with the most recent state observed for every invoked role. */
 function updateWorkerStatus(ctx: ExtensionToolContext, snapshot: WorkerSnapshot): void {
+	latestRoleSnapshots.delete(snapshot.role);
+	latestRoleSnapshots.set(snapshot.role, snapshot);
 	if (!ctx.hasUI) return;
 	// Clear the pre-3.1 editor widget if this extension was reloaded in place.
 	ctx.ui.setWidget(WIDGET_ID, undefined);
-	if (snapshot.status !== "paused") {
-		ctx.ui.setStatus(WIDGET_ID, undefined);
-		return;
-	}
-	const latest = snapshot.currentActivity ?? snapshot.recentActions.at(-1)?.label;
-	const activity = latest ? ` · ${latest}` : "";
-	ctx.ui.setStatus(WIDGET_ID, `Paused ${snapshot.jobId} · ${formatElapsed(snapshot.durationMs)} · ${formatContext(snapshot)}${activity}`);
+	const status = [...latestRoleSnapshots.values()]
+		.reverse()
+		.map((roleSnapshot) => {
+			const model = roleSnapshot.model.slice(roleSnapshot.model.indexOf("/") + 1);
+			const context = formatContext(roleSnapshot).replace(/ context$/, "");
+			return `${roleSnapshot.jobId} · ${context} • ${model} • ${roleSnapshot.thinking}`;
+		})
+		.join(" | ");
+	ctx.ui.setStatus(WIDGET_ID, ctx.ui.theme.fg("dim", status));
 }
 
 /** Obtain mutable state shared by call/result renderers, including during partial argument streaming. */
@@ -1202,10 +1272,12 @@ function renderWorkerResult(
 	rendererState(context).snapshot = snapshot;
 	const color = snapshot.status === "paused" ? "warning" : snapshot.status === "completed" ? "success" : isTerminal(snapshot.status) && snapshot.status !== "completed" ? "error" : "accent";
 	const elapsedLabel = isPartial ? "Elapsed" : "Took";
+	const latestActivity = snapshot.currentActivity ?? snapshot.recentActions.at(-1)?.label;
+	const activityLabel = snapshot.currentActivity ? "Now" : "Last";
 	const lines = [
 		standalone ? theme.fg(color, theme.bold(`${snapshot.jobId}: ${snapshot.status}`)) : "",
 		standalone ? theme.fg("muted", `Task: ${snapshot.taskDisplay}`) : "",
-		snapshot.currentActivity ? theme.fg("warning", `Now: ${snapshot.currentActivity}`) : "",
+		latestActivity ? theme.fg(snapshot.currentActivity ? "warning" : "muted", `${activityLabel}: ${latestActivity}`) : "",
 		theme.fg("dim", `${snapshot.phase} · boundary ${snapshot.sequence} · turn ${snapshot.turns}/${snapshot.budget.turns}`),
 		theme.fg("muted", `${snapshot.actionCounts.completed} actions complete · ${snapshot.actionCounts.failed} failed · ${formatContext(snapshot)}`),
 		theme.fg("accent", snapshot.recommendation),
@@ -1234,10 +1306,10 @@ function snapshotResult(snapshot: WorkerSnapshot, isError = false): { content: A
 
 /** Register one role-specific supervised worker starter. */
 function registerDelegate(pi: ExtensionAPI, role: Role): void {
-	const name = role === "mechanic" ? "delegate_mechanical" : "delegate_engineering";
+	const name = ROLE_TOOL_NAMES[role];
 	pi.registerTool({
 		name,
-		label: role === "mechanic" ? "↗ mechanic" : "↗ engineer",
+		label: ROLE_LABELS[role],
 		description: ROLE_DESCRIPTIONS[role],
 		promptSnippet: `${name}: start a supervised ${role} delegation that pauses after each completed action batch`,
 		promptGuidelines: [
@@ -1280,6 +1352,7 @@ function registerDelegate(pi: ExtensionAPI, role: Role): void {
 				const job = new WorkerJob(role, params.task, tools, resolved.role, ctx.cwd, config.policy, budget);
 				activeJob = job;
 				const progress = (snapshot: WorkerSnapshot) => {
+					updateWorkerStatus(ctx, snapshot);
 					onUpdate?.({ content: [{ type: "text", text: formatSnapshot(snapshot) }], details: snapshot });
 				};
 				const snapshot = await job.start(signal, progress);
@@ -1346,6 +1419,7 @@ function registerControl(pi: ExtensionAPI): void {
 					if (params.action === "revise" && !params.instructions) throw new Error("revise requires instructions");
 					const progress = (state: WorkerSnapshot) => {
 						state.managerAction = params.action;
+						updateWorkerStatus(ctx, state);
 						onUpdate?.({ content: [{ type: "text", text: formatSnapshot(state) }], details: state });
 					};
 					snapshot = await job.continue(params.action === "revise" ? params.instructions : undefined, params.actionBatches ?? 1, signal, progress);
@@ -1395,8 +1469,7 @@ function registerStatus(pi: ExtensionAPI): void {
 /** Register only in the parent process and clean every live child when the session shuts down. */
 export default function taskDispatcher(pi: ExtensionAPI): void {
 	if (process.env[WORKER_ENV]) return;
-	registerDelegate(pi, "mechanic");
-	registerDelegate(pi, "engineer");
+	for (const role of ROLES) registerDelegate(pi, role);
 	registerControl(pi);
 	registerStatus(pi);
 	pi.on("session_shutdown", async () => {

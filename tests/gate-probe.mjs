@@ -1,5 +1,5 @@
 /**
- * Verify that a worker-side turn boundary can abort Pi after a completed tool batch while keeping the RPC child reusable.
+ * Verify supervised codemode loading and a reusable worker-side boundary after one completed tool batch.
  */
 
 import { spawn } from "node:child_process";
@@ -55,7 +55,9 @@ export default function (pi: ExtensionAPI): void {
 		"--no-session",
 		"--no-extensions",
 		"--tools",
-		"read",
+		"codemode",
+		"--extension",
+		"builtin:codemode",
 		"--extension",
 		gatePath,
 	];
@@ -92,11 +94,11 @@ export default function (pi: ExtensionAPI): void {
 	});
 	child.on("message", (message) => boundaries.push(message));
 
-	// Run one tool batch and require the gate to settle the run before a productive follow-up turn.
+	// Run one codemode batch and require the gate to settle before a productive follow-up turn.
 	child.stdin.write(`${JSON.stringify({
 		id: "probe-1",
 		type: "prompt",
-		message: "Read package.json exactly once. Do not use any other tool. After reading it, report only its package name.",
+		message: "Call codemode exactly once with the raw JavaScript source: text('pi-task-dispatcher-codemode-ready')\nDo not use any other tool and do not add other script statements.",
 	})}\n`);
 	await Promise.race([
 		settled,
@@ -109,6 +111,9 @@ export default function (pi: ExtensionAPI): void {
 	if (!firstAssistantMessages.some((event) => event.message?.stopReason === "toolUse")) {
 		throw new Error("The first run did not execute the expected tool-use turn.");
 	}
+	if (!events.some((event) => event.type === "tool_execution_end" && event.toolName === "codemode" && !event.isError)) {
+		throw new Error("The isolated worker did not complete the selected built-in codemode tool.");
+	}
 
 	// Continue in the same in-memory RPC session and require a normal final answer without another tool batch.
 	events.length = 0;
@@ -118,7 +123,7 @@ export default function (pi: ExtensionAPI): void {
 	child.stdin.write(`${JSON.stringify({
 		id: "probe-2",
 		type: "prompt",
-		message: "Continue from the completed read. Do not call tools. Report only the package name.",
+		message: "Continue from the completed codemode result. Do not call tools. Report only the exact marker produced by the script.",
 	})}\n`);
 	await Promise.race([
 		settled,
@@ -132,7 +137,7 @@ export default function (pi: ExtensionAPI): void {
 		.map((part) => part.text)
 		.join("\n")
 		.trim();
-	if (!finalText.includes("pi-task-dispatcher")) throw new Error(`Unexpected continuation output: ${finalText}`);
+	if (!finalText.includes("pi-task-dispatcher-codemode-ready")) throw new Error(`Unexpected continuation output: ${finalText}`);
 
 	console.log(JSON.stringify({ firstBoundaryCount, firstAssistantMessages: firstAssistantMessages.length, finalText }, null, 2));
 	if (stderr.trim()) console.error(stderr.trim());
