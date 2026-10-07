@@ -227,7 +227,7 @@ Own only the supplied image, video, audio, or media-asset objective while the ca
 
 const ROLE_DESCRIPTIONS: Record<Role, string> = {
 	mechanic: "Start a supervised mechanical delegation for prescribed execution with a known method and result.",
-	assistant: "Start a supervised assistant delegation for bounded, low-complexity interpretation, synthesis, or routine updates.",
+	assistant: "Start a supervised assistant delegation for a subtask you would otherwise perform directly, when no other worker role applies.",
 	engineer: "Start a supervised engineering delegation for uncertain, cross-component, or implementation-intensive work.",
 	designer: "Start a supervised media-design delegation for image generation or editing and command-line image, video, or audio processing.",
 };
@@ -1313,6 +1313,9 @@ function registerDelegate(pi: ExtensionAPI, role: Role): void {
 		description: ROLE_DESCRIPTIONS[role],
 		promptSnippet: `${name}: start a supervised ${role} delegation that pauses after each completed action batch`,
 		promptGuidelines: [
+			...(role === "assistant"
+				? ["When no other worker role applies, use delegate_assistant for the user-requested work instead of performing it directly. Retain delegation decisions, worker supervision, result integration, and the final response."]
+				: []),
 			"Supply semantic workload units rather than raw turn or timeout values.",
 			"Inspect every paused state and choose continue, revise, recalculate, compact, checkpoint, cancel, or take over.",
 			"Worker reports remain evidence to review, not proof of correctness.",

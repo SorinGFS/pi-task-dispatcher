@@ -6,7 +6,7 @@ Each delegation runs in an isolated, in-memory Pi RPC session. After every cohes
 
 ## Features
 
-- **Four worker roles:** prescribed mechanical execution, bounded assistant work, broader engineering, and media design.
+- **Four worker roles:** prescribed mechanical execution, fallback assistant work, broader engineering, and media design.
 - **Enforced supervision:** a private parent-child IPC gate calls `ctx.abort()` after persisted tool results; pausing does not depend on the worker following a prompt.
 - **Explicit control:** continue, revise, recalculate, compact, checkpoint, cancel, or take over.
 - **Resumable context:** continuation uses the same in-memory worker session and completed tool results.
@@ -38,7 +38,7 @@ pi install npm:pi-task-dispatcher
 | Tool | Responsibility |
 | --- | --- |
 | `delegate_mechanical` | Execute prescribed work whose method and expected result are already known. |
-| `delegate_assistant` | Perform bounded, low-complexity interpretation, synthesis, or routine updates. |
+| `delegate_assistant` | Perform the user-requested work when no other worker role applies; the orchestrator does not perform that work directly. |
 | `delegate_engineering` | Investigate or implement uncertain, cross-component, or technically intensive work. |
 | `delegate_designer` | Create or edit image assets and process image, video, or audio files with available tools. |
 | `delegate_control` | Apply one explicit manager decision to a paused delegation. |
@@ -51,9 +51,11 @@ Only one live delegation is currently permitted. A terminal delegation may be in
 | Role | Selection rule |
 | --- | --- |
 | Mechanic | The method and expected result are known; execute exact steps. |
-| Assistant | The task needs limited judgment but remains bounded, low-risk, and locally verifiable. It does not assume manager authority or make architectural decisions. |
+| Assistant | When no other worker role applies, use `delegate_assistant` for the user-requested work instead of having the orchestrator perform it directly. |
 | Engineer | The cause, design, or implementation path is uncertain or spans components. |
 | Designer | The requested result is an image, video, audio, or related media asset or transformation. |
+
+The orchestrator retains responsibility for delegation decisions, worker supervision, integration of delegated results, and the final response.
 
 The designer can inspect images with `read`, use image models through `codemode`, and run explicitly selected command-line media programs through `bash` or `powershell`. Generated codemode images are runtime-temporary until the worker deliberately copies a selected output to the requested workspace destination and verifies it. Video and audio generation depends on explicitly available command-line programs or services; editing workflows can use programs such as `ffmpeg` when installed.
 
