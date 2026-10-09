@@ -70,6 +70,14 @@ try {
 	const control = tools.get("delegate_control");
 	assert(start && designerStart && control, "Expected supervised tools to register.");
 	assert(tools.has("delegate_mechanical") && tools.has("delegate_assistant"), "Expected every worker role to register.");
+	// Validate the shared least-privilege codemode guidance through every registered delegation surface.
+	const schemaGuidance = tools.get("delegate_mechanical").parameters.properties.tools.description;
+	assert.match(schemaGuidance, /codemode.*allowlist.*direct tool.*otherwise omit/i, "Schema guidance no longer describes the codemode delegation rule.");
+	for (const name of ["delegate_mechanical", "delegate_assistant", "delegate_engineering", "delegate_designer"]) {
+		const delegate = tools.get(name);
+		assert.equal(delegate.parameters.properties.tools.description, schemaGuidance, `${name} does not expose the shared codemode guidance in its tools schema.`);
+		assert(delegate.promptGuidelines.includes(schemaGuidance), `${name} does not expose the schema codemode guidance in its manager prompt metadata.`);
+	}
 	const theme = { fg(_color, text) { return text; }, bold(text) { return text; } };
 	let rendererInvalidations = 0;
 	const renderContext = { args: {}, state: {}, invalidate() { rendererInvalidations++; }, cwd: projectRoot };

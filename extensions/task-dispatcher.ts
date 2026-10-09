@@ -283,9 +283,12 @@ const WorkloadSchema = Type.Object({
 	expectedLongRunningSeconds: Type.Integer({ minimum: 0, maximum: 3_600 }),
 });
 
+/** Tell managers when a codemode delegation grant is warranted without granting it automatically. */
+const CODEMODE_SELECTION_GUIDANCE = "When codemode is active and delegated work materially benefits from JavaScript orchestration, batched/parallel/filtering of selected tools, or classifier/image models, include codemode in the delegated allowlist rather than reserving it for the manager; also include each direct tool the codemode script must call; otherwise omit it.";
+
 const DelegateParams = Type.Object({
 	task: Type.String({ minLength: 1, maxLength: 12_000 }),
-	tools: Type.Array(Type.String({ minLength: 1 }), { maxItems: 32 }),
+	tools: Type.Array(Type.String({ minLength: 1 }), { maxItems: 32, description: CODEMODE_SELECTION_GUIDANCE }),
 	workload: WorkloadSchema,
 });
 
@@ -1644,6 +1647,7 @@ function registerDelegate(pi: ExtensionAPI, role: Role): void {
 			...(role === "assistant"
 				? ["When no other worker role applies, use delegate_assistant for the user-requested work instead of performing it directly. Retain delegation decisions, worker supervision, result integration, and the final response."]
 				: []),
+			CODEMODE_SELECTION_GUIDANCE,
 			"Supply semantic workload units rather than raw turn or timeout values.",
 			"Inspect every paused state and choose continue, revise, recalculate, compact, checkpoint, cancel, or take over.",
 			"Worker reports remain evidence to review, not proof of correctness.",

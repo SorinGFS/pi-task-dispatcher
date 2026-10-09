@@ -6,7 +6,7 @@ import { spawn } from "node:child_process";
 import { mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { homedir, tmpdir } from "node:os";
 import path from "node:path";
-import readline from "node:readline";
+import { readStrictJsonl } from "./strict-jsonl.mjs";
 
 // Resolve the managed Pi release without embedding a machine-specific installation path.
 async function resolvePiCli() {
@@ -25,6 +25,7 @@ const gatePath = path.join(temporaryDirectory, "gate.ts");
 const codemodeOnlyPath = path.join(temporaryDirectory, "codemode-only.ts");
 const readProbePath = path.join(temporaryDirectory, "codemode-read-probe.txt");
 let child;
+let stdoutRecords;
 
 try {
 	// Abort the active worker run only after its complete tool batch has been persisted.
@@ -96,13 +97,18 @@ export default function codemodeOnlyExtension(pi: ExtensionAPI): void {
 		settledResolve = resolve;
 	});
 
-	// Collect public RPC events independently from the private boundary signal.
-	readline.createInterface({ input: child.stdout }).on("line", (line) => {
+	// Collect public LF-framed RPC events independently from the private boundary signal.
+	stdoutRecords = readStrictJsonl(child.stdout, (line) => {
 		if (!line.trim()) return;
 		const event = JSON.parse(line);
 		events.push(event);
 		if (event.type === "agent_settled") settledResolve();
 	});
+	// Surface malformed or unterminated child output during either gated wait without unhandled rejections.
+	const stdoutFramingFailure = new Promise((_, reject) => {
+		void stdoutRecords.catch(reject);
+	});
+	void stdoutFramingFailure.catch(() => undefined);
 	child.stderr.on("data", (chunk) => {
 		stderr += chunk.toString();
 	});
@@ -116,6 +122,7 @@ export default function codemodeOnlyExtension(pi: ExtensionAPI): void {
 	})}\n`);
 	await Promise.race([
 		settled,
+		stdoutFramingFailure,
 		new Promise((_, reject) => setTimeout(() => reject(new Error("First gated run did not settle.")), 120_000)),
 	]);
 
@@ -147,6 +154,7 @@ export default function codemodeOnlyExtension(pi: ExtensionAPI): void {
 	})}\n`);
 	await Promise.race([
 		settled,
+		stdoutFramingFailure,
 		new Promise((_, reject) => setTimeout(() => reject(new Error("Continuation run did not settle.")), 120_000)),
 	]);
 
@@ -162,14 +170,19 @@ export default function codemodeOnlyExtension(pi: ExtensionAPI): void {
 	console.log(JSON.stringify({ firstBoundaryCount, firstAssistantMessages: firstAssistantMessages.length, finalText, nativeCodemodeOnly: true }, null, 2));
 	if (stderr.trim()) console.error(stderr.trim());
 } finally {
-	// Close the reusable child and remove only the runtime-controlled probe directory.
-	if (child && child.exitCode === null && child.signalCode === null) {
-		child.stdin?.end();
-		await Promise.race([
-			new Promise((resolve) => child.once("close", resolve)),
-			new Promise((resolve) => setTimeout(resolve, 5_000)),
-		]);
-		if (child.exitCode === null && child.signalCode === null) child.kill("SIGKILL");
+	try {
+		// Close the reusable child before validating that its final stdout tail was LF-framed.
+		if (child && child.exitCode === null && child.signalCode === null) {
+			child.stdin?.end();
+			await Promise.race([
+				new Promise((resolve) => child.once("close", resolve)),
+				new Promise((resolve) => setTimeout(resolve, 5_000)),
+			]);
+			if (child.exitCode === null && child.signalCode === null) child.kill("SIGKILL");
+		}
+		if (stdoutRecords) await stdoutRecords;
+	} finally {
+		// Remove only the runtime-controlled probe directory, even when stdout framing failed.
+		await rm(temporaryDirectory, { recursive: true, force: true });
 	}
-	await rm(temporaryDirectory, { recursive: true, force: true });
 }

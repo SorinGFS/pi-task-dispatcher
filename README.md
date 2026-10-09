@@ -67,6 +67,8 @@ Every role tool requires:
 - `tools`: the smallest exact allowlist selected from Pi's built-in tools and active for the main agent;
 - `workload`: semantic estimates used by the deterministic budget formula.
 
+When `codemode` is active and delegated work materially benefits from JavaScript orchestration, batched/parallel/filtering of selected tools, or classifier/image models, include it in the delegated allowlist rather than reserving it for the manager. Also include each direct tool its script must call; otherwise omit `codemode`.
+
 ```json
 {
   "task": "Inspect the parser cache, correct its invalidation, and run the focused tests.",

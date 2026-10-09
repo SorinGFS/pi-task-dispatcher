@@ -1,7 +1,7 @@
 /** Deterministic JSONL/IPC worker used only by the dispatcher's lifecycle tests. */
 
 import { appendFile, readFile } from "node:fs/promises";
-import readline from "node:readline";
+import { readStrictJsonl } from "./strict-jsonl.mjs";
 
 const scenario = process.env.PI_TASK_DISPATCHER_FAKE_SCENARIO ?? "normal";
 const markerPath = process.env.PI_TASK_DISPATCHER_FAKE_PROMPT_MARKER;
@@ -22,7 +22,8 @@ function usage(input, output) {
 	};
 }
 
-readline.createInterface({ input: process.stdin }).on("line", async (line) => {
+// Process strict LF-framed RPC commands in order, including asynchronous scenario handlers.
+await readStrictJsonl(process.stdin, async (line) => {
 	if (!line.trim()) return;
 	const command = JSON.parse(line);
 	if (command.type === "set_auto_compaction") {

@@ -5,8 +5,11 @@
 import { readFile } from "node:fs/promises";
 
 const packageJson = JSON.parse(await readFile(new URL("../package.json", import.meta.url), "utf8"));
-const source = await readFile(new URL("../extensions/task-dispatcher.ts", import.meta.url), "utf8");
-const gateProbe = await readFile(new URL("./gate-probe.mjs", import.meta.url), "utf8");
+const [source, gateProbe, fakeRpcWorker] = await Promise.all([
+	readFile(new URL("../extensions/task-dispatcher.ts", import.meta.url), "utf8"),
+	readFile(new URL("./gate-probe.mjs", import.meta.url), "utf8"),
+	readFile(new URL("./fake-rpc-worker.mjs", import.meta.url), "utf8"),
+]);
 
 // Keep task budgets formula-owned and prevent accidental restoration of the v2 role limits.
 for (const forbidden of ["checkpointGraceSeconds", "timeoutSeconds", "maxTurns"]) {
@@ -49,7 +52,11 @@ for (const required of [
 	if (!source.includes(required)) throw new Error(`Missing supervised-protocol marker: ${required}`);
 }
 
-if (packageJson.version !== "3.1.0") throw new Error(`Expected release version 3.1.0, found ${packageJson.version}`);
+if (packageJson.version !== "3.1.1") throw new Error(`Expected release version 3.1.1, found ${packageJson.version}`);
+// Keep test-side RPC framing independent from readline's broader line-separator behavior.
+for (const [name, reader] of [["fake RPC worker", fakeRpcWorker], ["gate probe", gateProbe]]) {
+	if (reader.includes("node:readline")) throw new Error(`${name} still imports node:readline.`);
+}
 if (source.includes("builtin:codemode")) throw new Error("The dispatcher must not load codemode through a built-in extension selector.");
 if (!gateProbe.includes("createCodemodeExtension") || !gateProbe.includes('mode: "only"')) {
 	throw new Error("The live gate probe does not exercise the native codemode-only extension.");
