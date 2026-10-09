@@ -27,7 +27,9 @@ for (const required of [
 	"delegate_designer",
 	"delegate_control",
 	"delegate_status",
-	"builtin:codemode",
+	"codemode-only.ts",
+	"createCodemodeExtension",
+	'mode: "only"',
 	"task_dispatcher_boundary",
 	"without an enforced IPC boundary",
 	"--no-extensions",
@@ -35,9 +37,21 @@ for (const required of [
 	"set_auto_compaction",
 	"get_session_stats",
 	"renderResult",
+	"truncateToVisualLines",
+	"truncateToWidth",
+	'keyHint("app.tools.expand", "to expand")',
+	"stripTerminalSequences",
+	"message_update",
+	"tool_execution_update",
+	"PRESENTATION_UPDATE_THROTTLE_MS",
+	"context.lastComponent",
 ]) {
 	if (!source.includes(required)) throw new Error(`Missing supervised-protocol marker: ${required}`);
 }
 
-if (!String(packageJson.version).startsWith("3.")) throw new Error(`Expected a v3 package version, found ${packageJson.version}`);
+if (packageJson.version !== "3.1.0") throw new Error(`Expected release version 3.1.0, found ${packageJson.version}`);
+if (source.includes("builtin:codemode")) throw new Error("The dispatcher must not load codemode through a built-in extension selector.");
+if (!gateProbe.includes("createCodemodeExtension") || !gateProbe.includes('mode: "only"')) {
+	throw new Error("The live gate probe does not exercise the native codemode-only extension.");
+}
 console.log(`Static supervised-protocol checks passed for ${packageJson.name}@${packageJson.version}.`);

@@ -22,6 +22,8 @@ async function resolvePiCli() {
 const cliPath = await resolvePiCli();
 const temporaryDirectory = await mkdtemp(path.join(tmpdir(), "pi-task-dispatcher-gate-probe-"));
 const gatePath = path.join(temporaryDirectory, "gate.ts");
+const codemodeOnlyPath = path.join(temporaryDirectory, "codemode-only.ts");
+const readProbePath = path.join(temporaryDirectory, "codemode-read-probe.txt");
 let child;
 
 try {
@@ -43,6 +45,18 @@ export default function (pi: ExtensionAPI): void {
 `,
 		"utf8",
 	);
+	// Use Pi's public factory so only codemode is model-visible while selected direct tools remain script-callable.
+	await writeFile(
+		codemodeOnlyPath,
+		`import { createCodemodeExtension, type ExtensionAPI } from "@earendil-works/pi-coding-agent";
+const codemodeOnly = createCodemodeExtension({ mode: "only" });
+export default function codemodeOnlyExtension(pi: ExtensionAPI): void {
+	codemodeOnly(pi);
+}
+`,
+		"utf8",
+	);
+	await writeFile(readProbePath, "native-codemode-only-read-ready\n", "utf8");
 
 	// Prefer explicit test overrides, then the active parent Pi model exported in PI_* variables.
 	const activeModel = process.env.PI_TASK_DISPATCHER_GATE_MODEL
@@ -55,9 +69,9 @@ export default function (pi: ExtensionAPI): void {
 		"--no-session",
 		"--no-extensions",
 		"--tools",
-		"codemode",
+		"codemode,read",
 		"--extension",
-		"builtin:codemode",
+		codemodeOnlyPath,
 		"--extension",
 		gatePath,
 	];
@@ -94,11 +108,11 @@ export default function (pi: ExtensionAPI): void {
 	});
 	child.on("message", (message) => boundaries.push(message));
 
-	// Run one codemode batch and require the gate to settle before a productive follow-up turn.
+	// Run one codemode batch that invokes the selected direct read tool from the script, then require the gate to settle.
 	child.stdin.write(`${JSON.stringify({
 		id: "probe-1",
 		type: "prompt",
-		message: "Call codemode exactly once with the raw JavaScript source: text('pi-task-dispatcher-codemode-ready')\nDo not use any other tool and do not add other script statements.",
+		message: `Call codemode exactly once. In its JavaScript source, call await tools.read({ path: ${JSON.stringify(readProbePath)} }); and then call text("pi-task-dispatcher-codemode-ready"). Do not call tools directly and do not make any other tool calls.`,
 	})}\n`);
 	await Promise.race([
 		settled,
@@ -112,7 +126,13 @@ export default function (pi: ExtensionAPI): void {
 		throw new Error("The first run did not execute the expected tool-use turn.");
 	}
 	if (!events.some((event) => event.type === "tool_execution_end" && event.toolName === "codemode" && !event.isError)) {
-		throw new Error("The isolated worker did not complete the selected built-in codemode tool.");
+		throw new Error("The isolated worker did not complete the selected native codemode tool.");
+	}
+	if (!events.some((event) => event.type === "tool_execution_end" && event.toolName === "read" && event.parentToolCallId)) {
+		throw new Error("The codemode script could not call the explicitly selected direct read tool.");
+	}
+	if (events.some((event) => event.type === "tool_execution_start" && event.toolName === "read" && !event.parentToolCallId)) {
+		throw new Error("The worker called read directly instead of routing it through codemode-only mode.");
 	}
 
 	// Continue in the same in-memory RPC session and require a normal final answer without another tool batch.
@@ -123,7 +143,7 @@ export default function (pi: ExtensionAPI): void {
 	child.stdin.write(`${JSON.stringify({
 		id: "probe-2",
 		type: "prompt",
-		message: "Continue from the completed codemode result. Do not call tools. Report only the exact marker produced by the script.",
+		message: "Continue from the completed native codemode result. Do not call tools. Report only the exact marker produced by the script.",
 	})}\n`);
 	await Promise.race([
 		settled,
@@ -139,7 +159,7 @@ export default function (pi: ExtensionAPI): void {
 		.trim();
 	if (!finalText.includes("pi-task-dispatcher-codemode-ready")) throw new Error(`Unexpected continuation output: ${finalText}`);
 
-	console.log(JSON.stringify({ firstBoundaryCount, firstAssistantMessages: firstAssistantMessages.length, finalText }, null, 2));
+	console.log(JSON.stringify({ firstBoundaryCount, firstAssistantMessages: firstAssistantMessages.length, finalText, nativeCodemodeOnly: true }, null, 2));
 	if (stderr.trim()) console.error(stderr.trim());
 } finally {
 	// Close the reusable child and remove only the runtime-controlled probe directory.

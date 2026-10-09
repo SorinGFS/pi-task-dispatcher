@@ -94,7 +94,10 @@ try {
 	assert.match(partialRender, /Elapsed:/);
 	assert.equal(statusUpdates.at(-1)?.text, "engineer-1 · 11.0%/1k • active-model • medium");
 	const resultComponent = start.renderResult(result, { expanded: false, isPartial: false }, theme, renderContext);
-	const firstRender = resultComponent.render(100).join("\n");
+	renderContext.lastComponent = resultComponent;
+	const reusedResultComponent = start.renderResult(result, { expanded: false, isPartial: false }, theme, renderContext);
+	assert.equal(reusedResultComponent, resultComponent, "The result renderer did not reuse Pi's last component.");
+	const firstRender = reusedResultComponent.render(100).join("\n");
 	assert.match(firstRender, /Took:/);
 	assert.doesNotMatch(firstRender, /Elapsed:/);
 	for (let index = 0; index < 1_000; index++) {
@@ -124,7 +127,7 @@ try {
 	assert.match(managerCall.render(100).join("\n"), /manager: engineer-1 → completed/);
 	assert.doesNotMatch(managerCall.render(100).join("\n"), /continue\/completed/);
 
-	// The designer must load only the selected built-in codemode extension and account nested usage once.
+	// The designer must load only the selected native codemode-only extension and account nested usage once.
 	await writeFile(configPath, JSON.stringify({ designer: { model: "media-provider/media-model", thinking: "high" } }), "utf8");
 	process.env.PI_TASK_DISPATCHER_FAKE_SCENARIO = "codemode";
 	result = await designerStart.execute("start-designer", { task: "fake image job", tools: ["read", "codemode"], workload }, undefined, undefined, context);
@@ -157,6 +160,57 @@ try {
 	assert.equal(result.details.status, "completed");
 	assert.match(statusUpdates.at(-1)?.text ?? "", /designer-2.*\|.*engineer-1/);
 	await writeFile(configPath, "{}\n", "utf8");
+
+	// Streaming RPC updates must replace their partial text, preserve full UI details, and keep model output bounded.
+	process.env.PI_TASK_DISPATCHER_FAKE_SCENARIO = "presentation";
+	const presentationUpdates = [];
+	result = await start.execute(
+		"start-presentation",
+		{ task: "fake presentation job", tools: ["read"], workload },
+		undefined,
+		(update) => presentationUpdates.push(update.details?.presentationText ?? ""),
+		context,
+	);
+	assert(presentationUpdates.some((text) => text.includes("stream delta that must be replaced")), "Live assistant stream text was not presented.");
+	assert(presentationUpdates.some((text) => text.includes("partial read result that must be replaced")), "Live tool partial text was not presented.");
+	assert.equal(result.isError, false);
+	assert.equal(result.details.status, "paused");
+	assert.match(result.details.presentationText, /authoritative first assistant message/);
+	assert.match(result.details.presentationText, /tool start: read presentation\.txt/);
+	assert.match(result.details.presentationText, /tool completed: read presentation\.txt/);
+	assert.match(result.details.presentationText, /final read result six red/);
+	assert.doesNotMatch(result.details.presentationText, /stream delta that must be replaced|stream block that must be replaced|partial read result that must be replaced/);
+	assert.doesNotMatch(result.details.presentationText, /\u001b/, "Presentation text must not retain terminal control sequences.");
+	const presentationRenderContext = { args: {}, state: {}, invalidate() { rendererInvalidations++; }, cwd: projectRoot };
+	const collapsedComponent = start.renderResult(result, { expanded: false, isPartial: false }, theme, presentationRenderContext);
+	presentationRenderContext.lastComponent = collapsedComponent;
+	const collapsed = collapsedComponent.render(100).join("\n");
+	assert.match(collapsed, /earlier visual rows omitted/);
+	assert.match(collapsed, /to expand/);
+	assert.match(collapsed, /final read result six red/);
+	assert.doesNotMatch(collapsed, /authoritative first assistant message/, "Collapsed output must retain only the latest visual rows.");
+
+	result = await control.execute(
+		"continue-presentation",
+		{ jobId: result.details.jobId, action: "continue", actionBatches: 1 },
+		undefined,
+		undefined,
+		context,
+	);
+	assert.equal(result.isError, false);
+	assert.equal(result.details.status, "completed");
+	assert(result.details.workerTextDisplay.length <= 5_000, "Model-facing worker text was not bounded.");
+	assert(result.details.presentationText.length > 5_000, "Structured presentation text was unexpectedly bounded.");
+	assert.match(result.details.presentationText, /MIDDLE-ONLY-IN-EXPANDED-PRESENTATION/);
+	assert.doesNotMatch(result.content[0].text, /MIDDLE-ONLY-IN-EXPANDED-PRESENTATION/, "Model-facing state exposed the omitted middle of a long report.");
+	const expandedComponent = control.renderResult(result, { expanded: true, isPartial: false }, theme, presentationRenderContext);
+	presentationRenderContext.lastComponent = expandedComponent;
+	const expanded = expandedComponent.render(100).join("\n");
+	assert.match(expanded, /MIDDLE-ONLY-IN-EXPANDED-PRESENTATION/);
+	assert.match(expanded, /latest-presentation-marker/);
+	const reusedExpandedComponent = control.renderResult(result, { expanded: true, isPartial: false }, theme, presentationRenderContext);
+	assert.equal(reusedExpandedComponent, expandedComponent, "Expanded renderer state was not reused.");
+	assert.equal(reusedExpandedComponent.render(100).join("\n"), expanded, "Repeated expanded rendering changed output.");
 
 	// A tool-free output-limit stop must preserve the session so the manager can recover the report.
 	process.env.PI_TASK_DISPATCHER_FAKE_SCENARIO = "length";

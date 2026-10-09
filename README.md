@@ -10,7 +10,7 @@ Each delegation runs in an isolated, in-memory Pi RPC session. After every cohes
 - **Enforced supervision:** a private parent-child IPC gate calls `ctx.abort()` after persisted tool results; pausing does not depend on the worker following a prompt.
 - **Explicit control:** continue, revise, recalculate, compact, checkpoint, cancel, or take over.
 - **Resumable context:** continuation uses the same in-memory worker session and completed tool results.
-- **Least privilege:** every start selects an exact isolated-worker tool allowlist; delegation tools and unrelated discovered extensions are unavailable to the worker. Pi's built-in `codemode` extension loads only when explicitly selected.
+- **Least privilege:** every start selects an exact isolated-worker tool allowlist; delegation tools and unrelated discovered extensions are unavailable to the worker. When explicitly selected, a runtime-temporary extension loads Pi's public native `codemode` factory in `only` mode; it is never injected otherwise.
 - **Model agnostic:** every role inherits Pi's active model and thinking level unless an explicit role override is configured.
 - **Formula-owned budgets:** the manager supplies semantic workload units, while the dispatcher calculates turn and time ceilings from workload, role, and delegated-model limits.
 - **Context insight:** boundary reports include worker context usage, compactions, turns, elapsed time, action counts, and recommendations.
@@ -19,11 +19,11 @@ Each delegation runs in an isolated, in-memory Pi RPC session. After every cohes
 
 ## Requirements
 
-- Pi 1.0.4 or later
+- Pi 1.1.0 or later
 - Node.js 22.19.0 or later
 - One active, authenticated Pi model; optional role-specific models must also be available and authenticated
 
-The supervision gate requires the parent Pi process and child Pi CLI to run under Node.js with an inherited IPC channel. The dispatcher fails closed when that boundary cannot be established; it does not fall back to prompt-only supervision. Worker processes disable ordinary extension discovery and load the generated supervision gate plus Pi's built-in `codemode` extension only when that tool was explicitly selected.
+The supervision gate requires the parent Pi process and child Pi CLI to run under Node.js with an inherited IPC channel. The dispatcher fails closed when that boundary cannot be established; it does not fall back to prompt-only supervision. Worker processes disable ordinary extension discovery and load the generated supervision gate plus a generated native codemode-only extension only when that tool was explicitly selected.
 
 ## Installation
 
@@ -89,7 +89,7 @@ A workload unit is intentionally semantic:
 
 At least one investigation, change, or verification unit is required.
 
-Isolated workers accept `read`, `bash`, `powershell`, `edit`, `write`, `grep`, `find`, `ls`, and `codemode` when the selected tools are also active in the main Pi session. `codemode` is loaded as an explicit Pi built-in while ordinary extension discovery remains disabled. Its scripts can call only the worker's callable tools and non-LLM model catalog; unrelated manager extensions and delegation tools remain unavailable.
+Isolated workers accept `read`, `bash`, `powershell`, `edit`, `write`, `grep`, `find`, `ls`, and `codemode` when the selected tools are also active in the main Pi session. If `codemode` is selected, the child generates a temporary extension using Pi's public `createCodemodeExtension({ mode: "only" })` API while ordinary extension discovery remains disabled. This makes `codemode` model-visible without exposing selected direct tools to the worker model; its scripts can still call those selected callable tools and the non-LLM model catalog. Unrelated manager extensions and delegation tools remain unavailable.
 
 The current formula derives planned work turns from those units, applies a role factor and a bounded scale based on the selected delegated model's own context window, reserves two additional turns for synthesis or recovery, then derives active execution time from calculated turns plus expected long-running time. Administrative ceilings always win. Formula inputs and results are returned in every state report so they can be reviewed and recalculated. Time spent paused for manager deliberation does not consume the active execution budget.
 
@@ -146,9 +146,10 @@ A paused result contains:
 - active elapsed time and turns against calculated budgets;
 - context tokens, context window, percentage, and compaction counts;
 - a recommended next decision;
-- bounded worker text, if any.
+- bounded model-facing worker text, if any;
+- a complete sanitized live presentation ledger in structured result details, including streamed assistant text and child-tool lifecycle/output placeholders without image base64.
 
-The TUI renders the same structured state as a compact block. Expanding the tool result reveals bounded worker text. The complete action ledger and worker text remain in result details for state reconstruction rather than being discarded by display truncation.
+The TUI renders the same structured state as a compact block plus the latest five visual rows of the presentation ledger. When older rows are omitted, Pi's native tool-expansion key hint appears; expanding the tool result reveals the complete captured presentation text, not the 5,000-character model-facing worker-text preview. The complete action ledger, presentation ledger, and worker text remain in result details for state reconstruction rather than being discarded by display truncation.
 
 After the first worker state, one unindented, dim footer status remains below Pi's primary report and updates across worker lifecycle states. It retains the newest state observed for every invoked role, with the most recently updated role first and each entry ordered as identity, context, model, and thinking—for example, `engineer-2 · 10.3%/32k • model-name • medium | mechanic-1 · 8.1%/128k • smaller-model • low`. Each percentage and window comes from that delegation's own fresh worker session; a continuation accumulates context in the same job, while a new delegation starts a new context. Current or latest action details appear in the delegation or manager block rather than the footer.
 
@@ -208,7 +209,7 @@ Version 3 intentionally ignores the version 2 fields `maxTurns`, `timeoutSeconds
 - Session shutdown or extension reload disposes the child and runtime-controlled temporary files.
 - Worker process failures reject pending RPC operations and produce a failed state.
 - Worker role instructions and the supervision gate exist only in a runtime-controlled temporary directory.
-- The selected built-in `codemode` extension may create runtime-temporary image outputs; the designer must persist requested outputs explicitly before completion.
+- The selected native codemode-only extension may create runtime-temporary image outputs; the designer must persist requested outputs explicitly before completion.
 - The worker uses `--no-session`; no worker session file is persisted.
 
 Process separation is not a security sandbox. Worker tools execute with the Pi host's operating-system permissions. Tool availability does not establish task scope or authorization.
@@ -220,7 +221,7 @@ npm run check
 npm run test:gate
 ```
 
-`check` runs static release invariants and deterministic fake-RPC lifecycle and renderer scenarios. The fake child verifies all role registrations, pause/resume, output-limit recovery, usage deltas, nested codemode usage accounting, media metadata without base64 retention, persistent per-role footer state, full action-ledger retention, intercepted prompts, missing-boundary failure, fail-closed timeouts, pre-aborted operations, partial argument rendering, stable repeated rendering, and manager-state transitions without a model request.
+`check` runs static release invariants and deterministic fake-RPC lifecycle and renderer scenarios. The fake child verifies all role registrations, pause/resume, output-limit recovery, usage deltas, native codemode-only loading and nested direct-tool usage accounting, media metadata without base64 retention, streaming assistant/tool replacement semantics, five-visual-row previews with native expansion hints, complete expanded presentation beyond the 5,000-character model preview, persistent per-role footer state, full action-ledger retention, intercepted prompts, missing-boundary failure, fail-closed timeouts, pre-aborted operations, partial argument rendering, stable repeated rendering, and manager-state transitions without a model request.
 
-`test:gate` performs a small live model integration check with the active parent model exported by Pi through `PI_PROVIDER`, `PI_MODEL`, and `PI_REASONING_LEVEL`, falling back to Pi's configured default when those values are unavailable; it contains no provider or model assumption. Optional `PI_TASK_DISPATCHER_GATE_MODEL` and `PI_TASK_DISPATCHER_GATE_THINKING` overrides are available for explicit test matrices. The probe verifies selective built-in `codemode` loading, a private pause after its completed tool batch, and subsequent completion in the same in-memory child. It requires configured credentials and therefore is not a hermetic unit test.
+`test:gate` performs a small live model integration check with the active parent model exported by Pi through `PI_PROVIDER`, `PI_MODEL`, and `PI_REASONING_LEVEL`, falling back to Pi's configured default when those values are unavailable; it contains no provider or model assumption. Optional `PI_TASK_DISPATCHER_GATE_MODEL` and `PI_TASK_DISPATCHER_GATE_THINKING` overrides are available for explicit test matrices. The probe verifies generated native codemode-only loading, a codemode script calling an explicitly selected direct `read` tool, a private pause after that completed batch, and subsequent completion in the same in-memory child. It requires configured credentials and therefore is not a hermetic unit test.
 

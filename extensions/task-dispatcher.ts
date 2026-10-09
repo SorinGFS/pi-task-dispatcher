@@ -10,8 +10,10 @@ import {
 	type ExtensionAPI,
 	type ExtensionToolContext,
 	getAgentDir,
+	keyHint,
+	truncateToVisualLines,
 } from "@earendil-works/pi-coding-agent";
-import { Text } from "@earendil-works/pi-tui";
+import { stripTerminalSequences, Text, truncateToWidth, type Component } from "@earendil-works/pi-tui";
 import { Type } from "typebox";
 
 type Role = "mechanic" | "assistant" | "engineer" | "designer";
@@ -99,6 +101,17 @@ interface WorkerAction {
 	mediaOutputs?: WorkerMediaOutput[];
 }
 
+/** Keep one replaceable presentation record for each assistant response or child tool lifecycle. */
+interface WorkerPresentationEntry {
+	sequence: number;
+	id: string;
+	kind: "assistant" | "tool";
+	label: string;
+	status: "streaming" | "running" | "completed" | "failed";
+	text: string;
+	parentToolCallId?: string;
+}
+
 interface ContextMetrics {
 	tokens?: number;
 	contextWindow: number;
@@ -135,11 +148,28 @@ interface WorkerSnapshot {
 	recentActions: WorkerAction[];
 	actionLedger: WorkerAction[];
 	workerText: string;
+	/** Complete sanitized delegate activity retained only in structured tool details for UI expansion. */
+	presentationText: string;
 	workerTextDisplay: string;
 	workerTextTruncated: boolean;
 	diagnostic?: string;
 	tools: string[];
 	usage: UsageTotals;
+}
+
+/** Retain only RPC content fields needed for text presentation and image metadata extraction. */
+interface RpcContent {
+	type?: string;
+	text?: string;
+	data?: string;
+	mimeType?: string;
+}
+
+/** Model the result fields shared by partial and authoritative tool RPC events. */
+interface RpcToolResult {
+	content?: RpcContent[];
+	usage?: EventUsage;
+	estimatedTokensAfter?: number;
 }
 
 interface ParsedEvent {
@@ -154,14 +184,11 @@ interface ParsedEvent {
 	aborted?: boolean;
 	errorMessage?: string;
 	willRetry?: boolean;
-	result?: {
-		content?: Array<{ type?: string; text?: string; data?: string; mimeType?: string }>;
-		usage?: EventUsage;
-		estimatedTokensAfter?: number;
-	};
+	result?: RpcToolResult;
+	partialResult?: RpcToolResult;
 	message?: {
 		role?: string;
-		content?: Array<{ type?: string; text?: string }>;
+		content?: RpcContent[];
 		usage?: EventUsage;
 		stopReason?: string;
 		errorMessage?: string;
@@ -178,6 +205,7 @@ interface ParsedEvent {
 	parentToolCallId?: string;
 	args?: unknown;
 	isError?: boolean;
+	durationMs?: number;
 }
 
 interface GateBoundaryMessage {
@@ -195,6 +223,8 @@ const CONFIG_PATH = TEST_MODE && process.env.PI_TASK_DISPATCHER_CONFIG_PATH
 const WORKER_ENV = "PI_TASK_DISPATCHER_WORKER";
 const WIDGET_ID = "pi-task-dispatcher-worker";
 const MODEL_TEXT_LIMIT = 5_000;
+const PRESENTATION_PREVIEW_ROWS = 5;
+const PRESENTATION_UPDATE_THROTTLE_MS = 100;
 const STDERR_LIMIT = 16_000;
 const THINKING_LEVELS = new Set<ThinkingLevel>(["off", "minimal", "low", "medium", "high", "xhigh", "max"]);
 const ROLES: Role[] = ["mechanic", "assistant", "engineer", "designer"];
@@ -345,10 +375,17 @@ function headTail(text: string, limit = MODEL_TEXT_LIMIT): { text: string; trunc
 	};
 }
 
+/** Remove terminal controls from child-provided text before it enters a structured snapshot or renderer. */
+function sanitizePresentationText(value: unknown): string {
+	if (typeof value !== "string") return "";
+	return stripTerminalSequences(value)
+		.replace(/\r\n?/g, "\n")
+		.replace(/[\u0000-\u0008\u000B\u000C\u000E-\u001F\u007F]/g, "");
+}
+
 /** Keep one-line task and activity clues compact without introducing multiline omission markers. */
 function compactLine(value: unknown, limit = 180): string {
-	if (typeof value !== "string") return "Preparing delegation…";
-	const normalized = value.replaceAll(/\s+/g, " ").trim();
+	const normalized = sanitizePresentationText(value).replaceAll(/\s+/g, " ").trim();
 	if (!normalized) return "Preparing delegation…";
 	return normalized.length <= limit ? normalized : `${normalized.slice(0, Math.max(1, limit - 1))}…`;
 }
@@ -449,19 +486,51 @@ function getDirectPiInvocation(args: string[]): { command: string; args: string[
 /** Render a bounded activity label without embedding bulky command content. */
 function formatActivity(name: string, args: unknown): string {
 	if (name === "bash" && isRecord(args) && typeof args.command === "string") {
-		return `$ ${headTail(args.command, 140).text.replaceAll("\n", " ")}`;
+		return `$ ${headTail(sanitizePresentationText(args.command), 140).text.replaceAll("\n", " ")}`;
 	}
-	if (isRecord(args) && typeof args.path === "string") return `${name} ${args.path}`;
-	return name;
+	if (isRecord(args) && typeof args.path === "string") return `${name} ${sanitizePresentationText(args.path)}`;
+	return sanitizePresentationText(name) || "tool";
 }
 
 /** Extract a text-only assistant report from one finalized RPC message. */
 function assistantText(event: ParsedEvent): string {
 	return (event.message?.content ?? [])
-		.filter((part) => part.type === "text" && part.text)
-		.map((part) => part.text as string)
+		.filter((part) => part.type === "text" && typeof part.text === "string")
+		.map((part) => sanitizePresentationText(part.text))
+		.filter(Boolean)
 		.join("\n")
 		.trim();
+}
+
+/** Extract text and image placeholders without retaining image base64 in state or rendered output. */
+function presentationResult(result: RpcToolResult | undefined): { text: string; mediaOutputs: WorkerMediaOutput[] } {
+	const text: string[] = [];
+	const mediaOutputs: WorkerMediaOutput[] = [];
+	// Inspect content block types without persisting image payloads or redundant partial snapshots.
+	for (const part of result?.content ?? []) {
+		if (part.type === "text" && typeof part.text === "string") {
+			const value = sanitizePresentationText(part.text);
+			if (value) text.push(value);
+			continue;
+		}
+		if (part.type !== "image") continue;
+		const mimeType = sanitizePresentationText(part.mimeType) || "image";
+		const bytes = typeof part.data === "string" ? Buffer.from(part.data, "base64").length : 0;
+		if (typeof part.data === "string") mediaOutputs.push({ mimeType, bytes });
+		text.push(bytes > 0 ? `[image ${mimeType} · ${bytes} bytes]` : `[image ${mimeType}]`);
+	}
+	return { text: text.join("\n"), mediaOutputs };
+}
+
+/** Build the native codemode extension in only mode so selected direct tools stay script-callable but model-hidden. */
+function codemodeOnlySource(): string {
+	return `/** Load Pi's public codemode factory without loading discovered extensions. */
+import { createCodemodeExtension, type ExtensionAPI } from "@earendil-works/pi-coding-agent";
+const codemodeOnly = createCodemodeExtension({ mode: "only" });
+export default function codemodeOnlyExtension(pi: ExtensionAPI): void {
+	codemodeOnly(pi);
+}
+`;
 }
 
 /** Build the worker-only gate extension that stops the agent loop after persisted tool results. */
@@ -520,6 +589,11 @@ class WorkerJob {
 	private requestSequence = 0;
 	private actionSequence = 0;
 	private completionSequence = 0;
+	private presentationSequence = 0;
+	private readonly presentationEntries: WorkerPresentationEntry[] = [];
+	private readonly presentationById = new Map<string, WorkerPresentationEntry>();
+	private readonly assistantTextBlocks = new Map<number, string>();
+	private activeAssistantPresentation: WorkerPresentationEntry | undefined;
 	private activeActions = new Map<string, WorkerAction>();
 	private pendingRequests = new Map<string, { resolve: (event: ParsedEvent) => void; reject: (error: Error) => void }>();
 	private settleWaiter: { resolve: () => void; reject: (error: Error) => void } | undefined;
@@ -530,6 +604,7 @@ class WorkerJob {
 	private activeElapsedMs = 0;
 	private activeStartedAt: number | undefined;
 	private progressCallback: ((snapshot: WorkerSnapshot) => void) | undefined;
+	private progressUpdate: ReturnType<typeof setTimeout> | undefined;
 	private pausedLease: ReturnType<typeof setTimeout> | undefined;
 	private closePromise: Promise<void> | undefined;
 
@@ -566,8 +641,12 @@ class WorkerJob {
 		this.temporaryDirectory = await fs.promises.mkdtemp(path.join(os.tmpdir(), "pi-task-dispatcher-"));
 		const rolePromptPath = path.join(this.temporaryDirectory, `${this.role}.md`);
 		const gatePath = path.join(this.temporaryDirectory, "supervision-gate.ts");
+		const codemodeOnlyPath = path.join(this.temporaryDirectory, "codemode-only.ts");
 		await fs.promises.writeFile(rolePromptPath, ROLE_PROMPTS[this.role], { encoding: "utf8", mode: 0o600 });
 		await fs.promises.writeFile(gatePath, gateSource(), { encoding: "utf8", mode: 0o600 });
+		if (this.tools.includes("codemode")) {
+			await fs.promises.writeFile(codemodeOnlyPath, codemodeOnlySource(), { encoding: "utf8", mode: 0o600 });
+		}
 
 		const args = [
 			"--mode", "rpc",
@@ -577,7 +656,7 @@ class WorkerJob {
 			"--thinking", this.thinking,
 			...(this.tools.length > 0 ? ["--tools", this.tools.join(",")] : ["--no-tools"]),
 			"--append-system-prompt", rolePromptPath,
-			...(this.tools.includes("codemode") ? ["--extension", "builtin:codemode"] : []),
+			...(this.tools.includes("codemode") ? ["--extension", codemodeOnlyPath] : []),
 			"--extension", gatePath,
 		];
 		const invocation = getDirectPiInvocation(args);
@@ -681,6 +760,7 @@ class WorkerJob {
 	/** Return a stable state projection without exposing process handles or raw RPC records. */
 	snapshot(): WorkerSnapshot {
 		const display = headTail(this.workerText);
+		const presentationText = this.presentationText();
 		const completed = this.actions.filter((action) => action.status === "completed").length;
 		const failed = this.actions.filter((action) => action.status === "failed").length;
 		const currentAction = [...this.actions].reverse().find((action) => action.status === "running");
@@ -714,6 +794,7 @@ class WorkerJob {
 			recentActions,
 			actionLedger: this.actions.map((action) => ({ ...action, mediaOutputs: action.mediaOutputs?.map((output) => ({ ...output })) })),
 			workerText: this.workerText,
+			presentationText,
 			workerTextDisplay: display.text,
 			workerTextTruncated: display.truncated,
 			diagnostic: this.diagnostic,
@@ -726,6 +807,8 @@ class WorkerJob {
 	async dispose(): Promise<void> {
 		if (this.closePromise) return await this.closePromise;
 		this.clearPausedLease();
+		if (this.progressUpdate) clearTimeout(this.progressUpdate);
+		this.progressUpdate = undefined;
 		this.closePromise = (async () => {
 			const child = this.child;
 			if (child && child.exitCode === null && child.signalCode === null) {
@@ -789,7 +872,7 @@ class WorkerJob {
 		});
 	}
 
-	/** Reduce one complete JSONL record into requests, activity, usage, and settlement state. */
+	/** Reduce one complete JSONL record into requests, activity, usage, presentation, and settlement state. */
 	private processLine(line: string): void {
 		if (!line.trim()) return;
 		let event: ParsedEvent;
@@ -806,7 +889,20 @@ class WorkerJob {
 			}
 			return;
 		}
+		if (event.type === "message_start" && event.message?.role === "assistant") {
+			this.beginAssistantPresentation();
+			this.emitProgress();
+			return;
+		}
+		if (event.type === "message_update" && event.assistantMessageEvent) {
+			this.updateAssistantPresentation(event.assistantMessageEvent);
+			this.scheduleProgressUpdate();
+			return;
+		}
 		if (event.type === "message_end" && event.message?.role === "assistant") {
+			const text = assistantText(event);
+			this.completeAssistantPresentation(text);
+			if (text) this.workerText = text;
 			const stopReason = event.message.stopReason;
 			const gateAbort =
 				(stopReason === "aborted" || stopReason === "error") &&
@@ -815,10 +911,9 @@ class WorkerJob {
 				this.turns++;
 				this.lastStopReason = stopReason;
 				addUsage(this.usage, event.message.usage ?? event.usage);
-				const text = assistantText(event);
-				if (text) this.workerText = text;
-				if (event.message.errorMessage) this.diagnostic = event.message.errorMessage;
+				if (event.message.errorMessage) this.diagnostic = sanitizePresentationText(event.message.errorMessage);
 			}
+			this.emitProgress();
 			return;
 		}
 		if (event.type === "tool_execution_start" && event.toolCallId && event.toolName) {
@@ -834,23 +929,36 @@ class WorkerJob {
 			};
 			this.actions.push(action);
 			this.activeActions.set(action.toolCallId, action);
+			this.ensureToolPresentation(event.toolCallId, event.toolName, event.args, event.parentToolCallId);
 			this.emitProgress();
 			return;
 		}
+		if (event.type === "tool_execution_update" && event.toolCallId && event.toolName) {
+			const entry = this.ensureToolPresentation(event.toolCallId, event.toolName, event.args, event.parentToolCallId);
+			entry.status = "running";
+			entry.text = presentationResult(event.partialResult).text;
+			this.scheduleProgressUpdate();
+			return;
+		}
 		if (event.type === "tool_execution_end" && event.toolCallId) {
+			const result = presentationResult(event.result);
 			const action = this.activeActions.get(event.toolCallId);
+			const entry = this.ensureToolPresentation(
+				event.toolCallId,
+				event.toolName ?? action?.toolName ?? "tool",
+				event.args,
+				event.parentToolCallId ?? action?.parentToolCallId,
+			);
+			entry.status = event.isError ? "failed" : "completed";
+			entry.text = result.text;
 			if (action) {
 				action.status = event.isError ? "failed" : "completed";
 				action.endedAt = Date.now();
 				action.completionSequence = ++this.completionSequence;
-				const mediaOutputs = (event.result?.content ?? []).flatMap((part) =>
-					part.type === "image" && typeof part.mimeType === "string" && typeof part.data === "string"
-						? [{ mimeType: part.mimeType, bytes: Buffer.from(part.data, "base64").length }]
-						: []
-				);
-				if (mediaOutputs.length > 0) {
-					action.mediaOutputs = mediaOutputs;
-					action.label += ` · ${mediaOutputs.length} image${mediaOutputs.length === 1 ? "" : "s"}`;
+				if (result.mediaOutputs.length > 0) {
+					action.mediaOutputs = result.mediaOutputs;
+					action.label += ` · ${result.mediaOutputs.length} image${result.mediaOutputs.length === 1 ? "" : "s"}`;
+					entry.label = action.label;
 				}
 				this.activeActions.delete(event.toolCallId);
 			}
@@ -871,6 +979,96 @@ class WorkerJob {
 			return;
 		}
 		if (event.type === "agent_settled") this.settleWaiter?.resolve();
+	}
+
+	/** Start a replaceable assistant entry so streamed deltas never duplicate retained presentation text. */
+	private beginAssistantPresentation(): WorkerPresentationEntry {
+		if (this.activeAssistantPresentation) return this.activeAssistantPresentation;
+		this.assistantTextBlocks.clear();
+		const entry: WorkerPresentationEntry = {
+			sequence: ++this.presentationSequence,
+			id: `assistant-${this.presentationSequence}`,
+			kind: "assistant",
+			label: "assistant",
+			status: "streaming",
+			text: "",
+		};
+		this.presentationEntries.push(entry);
+		this.presentationById.set(entry.id, entry);
+		this.activeAssistantPresentation = entry;
+		return entry;
+	}
+
+	/** Apply JSON/RPC assistant text deltas and completed-block replacements by content index. */
+	private updateAssistantPresentation(update: NonNullable<ParsedEvent["assistantMessageEvent"]>): void {
+		if (!new Set(["text_start", "text_delta", "text_end"]).has(update.type ?? "")) return;
+		const entry = this.beginAssistantPresentation();
+		const index = typeof update.contentIndex === "number" ? update.contentIndex : 0;
+		if (update.type === "text_start") this.assistantTextBlocks.set(index, "");
+		else if (update.type === "text_delta") {
+			this.assistantTextBlocks.set(index, `${this.assistantTextBlocks.get(index) ?? ""}${sanitizePresentationText(update.delta)}`);
+		} else {
+			// JSON/RPC text_end content is authoritative for this streamed block.
+			this.assistantTextBlocks.set(index, sanitizePresentationText(update.content));
+		}
+		entry.text = [...this.assistantTextBlocks.entries()]
+			.sort(([left], [right]) => left - right)
+			.map(([, value]) => value)
+			.filter(Boolean)
+			.join("\n")
+			.trim();
+	}
+
+	/** Replace the live assistant entry with the authoritative final assistant message. */
+	private completeAssistantPresentation(text: string): void {
+		const entry = this.activeAssistantPresentation ?? (text ? this.beginAssistantPresentation() : undefined);
+		if (!entry) return;
+		entry.text = text;
+		entry.status = "completed";
+		this.assistantTextBlocks.clear();
+		this.activeAssistantPresentation = undefined;
+	}
+
+	/** Reuse one ordered presentation record per tool call while preserving child-call relationships. */
+	private ensureToolPresentation(toolCallId: string, toolName: string, args: unknown, parentToolCallId?: string): WorkerPresentationEntry {
+		const id = `tool-${toolCallId}`;
+		const existing = this.presentationById.get(id);
+		if (existing) return existing;
+		const action = this.activeActions.get(toolCallId);
+		const entry: WorkerPresentationEntry = {
+			sequence: ++this.presentationSequence,
+			id,
+			kind: "tool",
+			label: action?.label ?? formatActivity(toolName, args),
+			status: "running",
+			text: "",
+			parentToolCallId,
+		};
+		this.presentationEntries.push(entry);
+		this.presentationById.set(id, entry);
+		return entry;
+	}
+
+	/** Format retained presentation entries from their latest state without retaining repeated partial snapshots. */
+	private presentationText(): string {
+		return this.presentationEntries
+			.map((entry) => {
+				if (entry.kind === "assistant") {
+					if (!entry.text) return "";
+					return `${entry.status === "streaming" ? "assistant streaming" : "assistant"}:\n${entry.text}`;
+				}
+				const kind = entry.parentToolCallId ? "child tool" : "tool";
+				const lines = [`${kind} start: ${entry.label}`];
+				if (entry.status === "running") {
+					if (entry.text) lines.push(`${kind} update: ${entry.label}`, entry.text);
+				} else {
+					lines.push(`${kind} ${entry.status}: ${entry.label}`);
+					if (entry.text) lines.push(entry.text);
+				}
+				return lines.join("\n");
+			})
+			.filter(Boolean)
+			.join("\n\n");
 	}
 
 	/** Execute one or more supervised action batches while respecting calculated ceilings. */
@@ -1082,8 +1280,19 @@ class WorkerJob {
 		if (directory) await fs.promises.rm(directory, { recursive: true, force: true });
 	}
 
+	/** Coalesce token and partial-result bursts before rebuilding and serializing the complete snapshot. */
+	private scheduleProgressUpdate(): void {
+		if (this.progressUpdate) return;
+		this.progressUpdate = setTimeout(() => {
+			this.progressUpdate = undefined;
+			this.emitProgress();
+		}, PRESENTATION_UPDATE_THROTTLE_MS);
+	}
+
 	/** Refresh the partial tool block with elapsed time and the latest active command. */
 	private emitProgress(): void {
+		if (this.progressUpdate) clearTimeout(this.progressUpdate);
+		this.progressUpdate = undefined;
 		try {
 			this.progressCallback?.(this.snapshot());
 		} catch {
@@ -1172,6 +1381,15 @@ function formatElapsed(durationMs: number): string {
 	return seconds < 60 ? `${seconds}s` : `${Math.floor(seconds / 60)}m ${seconds % 60}s`;
 }
 
+/** Use Pi's configured expansion binding when interactive UI state exists, with a harmless noninteractive render fallback. */
+function expansionHint(theme: any): string {
+	try {
+		return keyHint("app.tools.expand", "to expand");
+	} catch {
+		return theme.fg("muted", "to expand");
+	}
+}
+
 /** Format one bounded state report for both model consumption and non-TUI modes. */
 function formatSnapshot(snapshot: WorkerSnapshot): string {
 	const context = snapshot.context.percent === undefined
@@ -1233,29 +1451,144 @@ function renderArgumentSummary(value: unknown): { task: string; workload: string
 	return { task: compactLine(value.task), workload: `${tools} tools · ${investigation}/${change}/${verification} I/C/V units` };
 }
 
-/** Create a wrapping component whose text can reflect shared renderer state after execution updates. */
-function dynamicText(build: () => string): { render(width: number): string[]; invalidate(): void } {
-	const text = new Text("", 0, 0);
-	let currentText: string | undefined;
-	return {
-		render(width) {
-			let nextText: string;
-			try {
-				nextText = build();
-			} catch {
-				nextText = "Preparing delegation…";
+/** Reuse dynamic text components while changing their source only outside the TUI render cycle. */
+class DynamicTextComponent {
+	private readonly text = new Text("", 0, 0);
+	private currentText: string | undefined;
+	private build: () => string;
+
+	constructor(build: () => string) {
+		this.build = build;
+	}
+
+	setBuild(build: () => string): void {
+		this.build = build;
+	}
+
+	render(width: number): string[] {
+		let nextText: string;
+		try {
+			nextText = this.build();
+		} catch {
+			nextText = "Preparing delegation…";
+		}
+		// Text.setText() invalidates the TUI, so call it only when observable content changed.
+		if (nextText !== this.currentText) {
+			this.currentText = nextText;
+			this.text.setText(nextText);
+		}
+		return this.text.render(width);
+	}
+
+	invalidate(): void {
+		this.text.invalidate();
+	}
+}
+
+/** Reuse the call-renderer component from Pi's context instead of allocating one for every update. */
+function dynamicText(context: any, build: () => string, stateKey = "callComponent"): Component {
+	const state = rendererState(context);
+	const previous = context.lastComponent;
+	const component = previous instanceof DynamicTextComponent
+		? previous
+		: state[stateKey] instanceof DynamicTextComponent
+			? state[stateKey] as DynamicTextComponent
+			: new DynamicTextComponent(build);
+	component.setBuild(build);
+	state[stateKey] = component;
+	return component;
+}
+
+/** Render the full presentation ledger with Pi's native visual-row truncation and expansion hint. */
+class DelegateResultComponent {
+	private snapshot: WorkerSnapshot | undefined;
+	private expanded = false;
+	private isPartial = false;
+	private standalone = false;
+	private theme: any = undefined;
+	private signature = "";
+	private cachedWidth: number | undefined;
+	private cachedLines: string[] | undefined;
+
+	update(snapshot: WorkerSnapshot, expanded: boolean, isPartial: boolean, theme: any, standalone: boolean): void {
+		const presentation = snapshot.presentationText ?? "";
+		const signature = [
+			snapshot.jobId,
+			snapshot.status,
+			snapshot.taskDisplay,
+			snapshot.phase,
+			snapshot.sequence,
+			snapshot.turns,
+			snapshot.durationMs,
+			snapshot.currentActivity ?? "",
+			snapshot.actionCounts.completed,
+			snapshot.actionCounts.failed,
+			snapshot.recommendation,
+			presentation,
+			expanded,
+			isPartial,
+			standalone,
+		].join("\u0000");
+		if (this.signature === signature && this.theme === theme) return;
+		this.snapshot = snapshot;
+		this.expanded = expanded;
+		this.isPartial = isPartial;
+		this.standalone = standalone;
+		this.theme = theme;
+		this.signature = signature;
+		this.cachedWidth = undefined;
+		this.cachedLines = undefined;
+	}
+
+	render(width: number): string[] {
+		if (this.cachedWidth === width && this.cachedLines) return this.cachedLines;
+		const snapshot = this.snapshot;
+		if (!snapshot) return [];
+		const color = snapshot.status === "paused" ? "warning" : snapshot.status === "completed" ? "success" : isTerminal(snapshot.status) && snapshot.status !== "completed" ? "error" : "accent";
+		const latestActivity = snapshot.currentActivity ?? snapshot.recentActions.at(-1)?.label;
+		const activityLabel = snapshot.currentActivity ? "Now" : "Last";
+		const header = [
+			this.standalone ? this.theme.fg(color, this.theme.bold(`${snapshot.jobId}: ${snapshot.status}`)) : "",
+			this.standalone ? this.theme.fg("muted", `Task: ${snapshot.taskDisplay}`) : "",
+			latestActivity ? this.theme.fg(snapshot.currentActivity ? "warning" : "muted", `${activityLabel}: ${latestActivity}`) : "",
+			this.theme.fg("dim", `${snapshot.phase} · boundary ${snapshot.sequence} · turn ${snapshot.turns}/${snapshot.budget.turns}`),
+			this.theme.fg("muted", `${snapshot.actionCounts.completed} actions complete · ${snapshot.actionCounts.failed} failed · ${formatContext(snapshot)}`),
+			this.theme.fg("accent", snapshot.recommendation),
+		].filter(Boolean).join("\n");
+		const lines = new Text(header, 0, 0).render(width);
+		const presentation = snapshot.presentationText ?? "";
+		if (presentation) {
+			// Reapply styling per line because Pi resets terminal attributes at every rendered row.
+			const styledPresentation = presentation
+				.split("\n")
+				.map((line) => this.theme.fg("dim", line))
+				.join("\n");
+			if (this.expanded) {
+				lines.push("", ...new Text(styledPresentation, 0, 0).render(width));
+			} else {
+				const preview = truncateToVisualLines(styledPresentation, PRESENTATION_PREVIEW_ROWS, width, 0, "end");
+				if (preview.visualLines.length > 0) {
+					lines.push("");
+					if (preview.skippedCount > 0) {
+						const hint = this.theme.fg("muted", `… ${preview.skippedCount} earlier visual rows omitted (`)
+							+ expansionHint(this.theme)
+							+ this.theme.fg("muted", ")");
+						lines.push(truncateToWidth(hint, width, "..."));
+					}
+					lines.push(...preview.visualLines);
+				}
 			}
-			// Text.setText() invalidates the TUI, so call it only when observable content changed.
-			if (nextText !== currentText) {
-				currentText = nextText;
-				text.setText(nextText);
-			}
-			return text.render(width);
-		},
-		invalidate() {
-			text.invalidate();
-		},
-	};
+		}
+		lines.push(this.theme.fg("dim", `${this.isPartial ? "Elapsed" : "Took"}: ${formatElapsed(snapshot.durationMs)}`));
+		this.cachedWidth = width;
+		this.cachedLines = lines;
+		return lines;
+	}
+
+	invalidate(): void {
+		this.cachedWidth = undefined;
+		this.cachedLines = undefined;
+	}
 }
 
 /** Render only nonredundant result details; the shared call header owns identity, task, and status. */
@@ -1266,25 +1599,20 @@ function renderWorkerResult(
 	theme: any,
 	context: any,
 	standalone = false,
-): Text {
+): Component {
 	const snapshot = result.details as WorkerSnapshot | undefined;
-	if (!snapshot) return new Text(theme.fg(isPartial ? "warning" : "muted", result.content[0]?.text ?? "Delegation state unavailable"), 0, 0);
-	rendererState(context).snapshot = snapshot;
-	const color = snapshot.status === "paused" ? "warning" : snapshot.status === "completed" ? "success" : isTerminal(snapshot.status) && snapshot.status !== "completed" ? "error" : "accent";
-	const elapsedLabel = isPartial ? "Elapsed" : "Took";
-	const latestActivity = snapshot.currentActivity ?? snapshot.recentActions.at(-1)?.label;
-	const activityLabel = snapshot.currentActivity ? "Now" : "Last";
-	const lines = [
-		standalone ? theme.fg(color, theme.bold(`${snapshot.jobId}: ${snapshot.status}`)) : "",
-		standalone ? theme.fg("muted", `Task: ${snapshot.taskDisplay}`) : "",
-		latestActivity ? theme.fg(snapshot.currentActivity ? "warning" : "muted", `${activityLabel}: ${latestActivity}`) : "",
-		theme.fg("dim", `${snapshot.phase} · boundary ${snapshot.sequence} · turn ${snapshot.turns}/${snapshot.budget.turns}`),
-		theme.fg("muted", `${snapshot.actionCounts.completed} actions complete · ${snapshot.actionCounts.failed} failed · ${formatContext(snapshot)}`),
-		theme.fg("accent", snapshot.recommendation),
-		expanded && snapshot.workerTextDisplay ? `\n${snapshot.workerTextDisplay}` : "",
-		theme.fg("dim", `${elapsedLabel}: ${formatElapsed(snapshot.durationMs)}`),
-	].filter(Boolean);
-	return new Text(lines.join("\n"), 0, 0);
+	if (!snapshot) return dynamicText(context, () => theme.fg(isPartial ? "warning" : "muted", result.content[0]?.text ?? "Delegation state unavailable"), "resultTextComponent");
+	const state = rendererState(context);
+	state.snapshot = snapshot;
+	const previous = context.lastComponent;
+	const component = previous instanceof DelegateResultComponent
+		? previous
+		: state.resultComponent instanceof DelegateResultComponent
+			? state.resultComponent as DelegateResultComponent
+			: new DelegateResultComponent();
+	component.update(snapshot, expanded, isPartial, theme, standalone);
+	state.resultComponent = component;
+	return component;
 }
 
 /** Package a snapshot as bounded model content plus complete machine-readable details. */
@@ -1326,7 +1654,7 @@ function registerDelegate(pi: ExtensionAPI, role: Role): void {
 		annotations: { readOnlyHint: false, destructiveHint: true, idempotentHint: false, openWorldHint: true },
 		renderCall(args, theme, context) {
 			const expectedId = `${role}-${nextJobIndex}`;
-			return dynamicText(() => {
+			return dynamicText(context, () => {
 				const snapshot = rendererState(context).snapshot as WorkerSnapshot | undefined;
 				const current = renderArgumentSummary(context.args ?? args);
 				const id = snapshot?.jobId ?? expectedId;
@@ -1388,7 +1716,7 @@ function registerControl(pi: ExtensionAPI): void {
 		executionMode: "sequential",
 		annotations: { readOnlyHint: false, destructiveHint: true, idempotentHint: false, openWorldHint: true },
 		renderCall(args, theme, context) {
-			return dynamicText(() => {
+			return dynamicText(context, () => {
 				const snapshot = rendererState(context).snapshot as WorkerSnapshot | undefined;
 				const current = isRecord(context.args) ? context.args : isRecord(args) ? args : {};
 				const jobId = typeof current.jobId === "string" ? current.jobId : "delegation";
