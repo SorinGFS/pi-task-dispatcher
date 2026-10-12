@@ -48,17 +48,40 @@ for (const required of [
 	"tool_execution_update",
 	"PRESENTATION_UPDATE_THROTTLE_MS",
 	"context.lastComponent",
+	"task_dispatcher_proxy_request",
+	"task_dispatcher_proxy_cancel",
+	"task_dispatcher_proxy_update",
+	"task_dispatcher_proxy_result",
+	"buildDelegatedToolManifests",
+	"ctx.executeTool",
+	"revalidateManifest",
+	"openExecutorLease",
+	"authorizeNestedToolCall",
+	"PROXY_PAYLOAD_LIMIT_BYTES",
+	"PROXY_MAX_IN_FLIGHT_REQUESTS",
+	"PROXY_MAX_REQUESTS_PER_JOB",
+	"REVOKED_EXECUTOR_ROOT_LIMIT",
+	"revokedExecutorGuardSaturated",
+	"randomBytes",
+	"Type.Unsafe",
 ]) {
 	if (!source.includes(required)) throw new Error(`Missing supervised-protocol marker: ${required}`);
 }
 
-if (packageJson.version !== "3.1.1") throw new Error(`Expected release version 3.1.1, found ${packageJson.version}`);
+if (packageJson.version !== "3.2.0") throw new Error(`Expected release version 3.2.0, found ${packageJson.version}`);
 // Keep test-side RPC framing independent from readline's broader line-separator behavior.
 for (const [name, reader] of [["fake RPC worker", fakeRpcWorker], ["gate probe", gateProbe]]) {
 	if (reader.includes("node:readline")) throw new Error(`${name} still imports node:readline.`);
 }
 if (source.includes("builtin:codemode")) throw new Error("The dispatcher must not load codemode through a built-in extension selector.");
-if (!gateProbe.includes("createCodemodeExtension") || !gateProbe.includes('mode: "only"')) {
-	throw new Error("The live gate probe does not exercise the native codemode-only extension.");
+for (const forbidden of ["ISOLATED_WORKER_TOOLS", "MUTATING_TOOLS", "Isolated workers do not support these tools"]) {
+	if (source.includes(forbidden)) throw new Error(`Legacy tool-name classification remains in source: ${forbidden}`);
+}
+if (!source.includes("ctx.tools")) throw new Error("Delegated tool grants must be built from manager-callable ctx.tools.");
+if (!fakeRpcWorker.includes("security-cross-job") || !fakeRpcWorker.includes("security-paused") || !fakeRpcWorker.includes("proxy-rich") || !fakeRpcWorker.includes("transitive")) {
+	throw new Error("The deterministic worker no longer covers proxy security and rich-result transport.");
+}
+for (const required of ['"task-dispatcher.ts"', "managerCalls", 'tools: ["read", "codemode"]', "parentToolCallId"]) {
+	if (!gateProbe.includes(required)) throw new Error(`The live gate probe no longer exercises the release proxy/codemode path: ${required}`);
 }
 console.log(`Static supervised-protocol checks passed for ${packageJson.name}@${packageJson.version}.`);

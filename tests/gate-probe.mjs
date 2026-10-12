@@ -1,188 +1,211 @@
-/**
- * Verify supervised codemode loading and a reusable worker-side boundary after one completed tool batch.
- */
+/** Exercise the release extension against a live Pi child, native codemode, and a manager-proxied tool. */
 
-import { spawn } from "node:child_process";
+import assert from "node:assert/strict";
+import { execFile } from "node:child_process";
 import { mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
+import { createRequire } from "node:module";
 import { homedir, tmpdir } from "node:os";
 import path from "node:path";
-import { readStrictJsonl } from "./strict-jsonl.mjs";
+import { promisify } from "node:util";
 
-// Resolve the managed Pi release without embedding a machine-specific installation path.
-async function resolvePiCli() {
+const executeFile = promisify(execFile);
+const projectRoot = path.resolve(import.meta.dirname, "..");
+const temporaryDirectory = await mkdtemp(path.join(tmpdir(), "pi-task-dispatcher-gate-probe-"));
+const configPath = path.join(temporaryDirectory, "task-dispatcher.json");
+const readProbePath = path.join(temporaryDirectory, "codemode-read-probe.txt");
+const marker = "pi-task-dispatcher-manager-proxy-ready";
+const inheritedWorkerRole = process.env.PI_TASK_DISPATCHER_WORKER;
+let handlers = new Map();
+
+/** Resolve the managed Pi package and CLI without embedding a machine-specific installation path. */
+async function resolvePiRuntime() {
 	const installRoot = process.env.PI_MANAGED_INSTALL_ROOT ?? path.join(homedir(), ".pi", "agent", "install");
 	const version = (await readFile(path.join(installRoot, "current-version"), "utf8")).trim();
 	const packageRoot = path.join(installRoot, "releases", version, "node_modules", "@earendil-works", "pi-coding-agent");
 	const packageJson = JSON.parse(await readFile(path.join(packageRoot, "package.json"), "utf8"));
 	const declaredBin = typeof packageJson.bin === "string" ? packageJson.bin : packageJson.bin?.pi;
 	if (!declaredBin) throw new Error("The managed Pi package does not declare its CLI entry point.");
-	return path.resolve(packageRoot, declaredBin);
+	return { packageRoot, cliPath: path.resolve(packageRoot, declaredBin) };
 }
 
-const cliPath = await resolvePiCli();
-const temporaryDirectory = await mkdtemp(path.join(tmpdir(), "pi-task-dispatcher-gate-probe-"));
-const gatePath = path.join(temporaryDirectory, "gate.ts");
-const codemodeOnlyPath = path.join(temporaryDirectory, "codemode-only.ts");
-const readProbePath = path.join(temporaryDirectory, "codemode-read-probe.txt");
-let child;
-let stdoutRecords;
+/** Parse Pi's human-readable model sizes for the dispatcher's formula-only budget metadata. */
+function parseSize(value) {
+	const match = /^(\d+(?:\.\d+)?)([KMG])?$/i.exec(value ?? "");
+	if (!match) return undefined;
+	const scale = { K: 1_000, M: 1_000_000, G: 1_000_000_000 }[match[2]?.toUpperCase()] ?? 1;
+	return Math.round(Number(match[1]) * scale);
+}
+
+/** Select the explicit/active model or the first credential-backed model listed by Pi. */
+async function resolveModel(cliPath) {
+	const { stdout } = await executeFile(process.execPath, [cliPath, "--list-models"], { maxBuffer: 8 * 1024 * 1024 });
+	const rows = stdout.split(/\r?\n/).slice(1).map((line) => line.trim().split(/\s+/)).filter((columns) => columns.length >= 4);
+	const requested = process.env.PI_TASK_DISPATCHER_GATE_MODEL
+		?? (process.env.PI_PROVIDER && process.env.PI_MODEL ? `${process.env.PI_PROVIDER}/${process.env.PI_MODEL}` : undefined);
+	const selected = requested
+		? rows.find(([provider, id]) => `${provider}/${id}` === requested)
+		: rows[0];
+	if (!selected && !requested) throw new Error("Pi did not list an available model for the live gate probe.");
+	const [provider, id] = requested ? requested.split(/\/(.+)/) : selected;
+	if (!provider || !id) throw new Error(`Invalid gate model: ${requested}`);
+	return {
+		provider,
+		id,
+		contextWindow: parseSize(selected?.[2]) ?? 272_000,
+		maxTokens: parseSize(selected?.[3]) ?? 128_000,
+	};
+}
 
 try {
-	// Abort the active worker run only after its complete tool batch has been persisted.
-	await writeFile(
-		gatePath,
-		`import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
-export default function (pi: ExtensionAPI): void {
-	pi.on("turn_end", async (event, ctx) => {
-		if (event.toolResults.length === 0) return;
-		if (typeof process.send === "function") process.send({
-			type: "task_dispatcher_boundary",
-			turnIndex: event.turnIndex,
-			toolResults: event.toolResults.length,
-		});
-		ctx.abort();
-	});
-}
-`,
-		"utf8",
-	);
-	// Use Pi's public factory so only codemode is model-visible while selected direct tools remain script-callable.
-	await writeFile(
-		codemodeOnlyPath,
-		`import { createCodemodeExtension, type ExtensionAPI } from "@earendil-works/pi-coding-agent";
-const codemodeOnly = createCodemodeExtension({ mode: "only" });
-export default function codemodeOnlyExtension(pi: ExtensionAPI): void {
-	codemodeOnly(pi);
-}
-`,
-		"utf8",
-	);
-	await writeFile(readProbePath, "native-codemode-only-read-ready\n", "utf8");
+	const { packageRoot: piRoot, cliPath } = await resolvePiRuntime();
+	const model = await resolveModel(cliPath);
+	await writeFile(configPath, "{}\n", "utf8");
+	await writeFile(readProbePath, `${marker}\n`, "utf8");
 
-	// Prefer explicit test overrides, then the active parent Pi model exported in PI_* variables.
-	const activeModel = process.env.PI_TASK_DISPATCHER_GATE_MODEL
-		?? (process.env.PI_PROVIDER && process.env.PI_MODEL ? `${process.env.PI_PROVIDER}/${process.env.PI_MODEL}` : undefined);
-	const activeThinking = process.env.PI_TASK_DISPATCHER_GATE_THINKING ?? process.env.PI_REASONING_LEVEL;
-	const workerArgs = [
-		cliPath,
-		"--mode",
-		"rpc",
-		"--no-session",
-		"--no-extensions",
-		"--tools",
-		"codemode,read",
-		"--extension",
-		codemodeOnlyPath,
-		"--extension",
-		gatePath,
-	];
-	if (activeModel) workerArgs.push("--model", activeModel);
-	if (activeThinking) workerArgs.push("--thinking", activeThinking);
-
-	child = spawn(
-		process.execPath,
-		workerArgs,
-		{
-			cwd: path.resolve(import.meta.dirname, ".."),
-			stdio: ["pipe", "pipe", "pipe", "ipc"],
-			env: { ...process.env, PI_TASK_DISPATCHER_WORKER: "probe" },
+	// Load the release source while directing only its child-process lookup and configuration to the probe.
+	delete process.env.PI_TASK_DISPATCHER_WORKER;
+	process.env.PI_TASK_DISPATCHER_TEST_MODE = "1";
+	process.env.PI_TASK_DISPATCHER_CONFIG_PATH = configPath;
+	process.env.PI_TASK_DISPATCHER_CLI_OVERRIDE = cliPath;
+	const requireFromPi = createRequire(path.join(piRoot, "package.json"));
+	const { createJiti } = requireFromPi("jiti");
+	const jiti = createJiti(import.meta.url, {
+		interopDefault: true,
+		alias: {
+			"@earendil-works/pi-coding-agent": path.join(piRoot, "dist", "index.js"),
+			"@earendil-works/pi-tui": requireFromPi.resolve("@earendil-works/pi-tui"),
+			typebox: requireFromPi.resolve("typebox"),
 		},
-	);
-
-	const events = [];
-	const boundaries = [];
-	let stderr = "";
-	let settledResolve;
-	let settled = new Promise((resolve) => {
-		settledResolve = resolve;
 	});
+	const loaded = await jiti.import(path.join(projectRoot, "extensions", "task-dispatcher.ts"));
+	const register = loaded.default ?? loaded;
+	const registeredTools = new Map();
+	handlers = new Map();
+	const readTool = {
+		name: "read",
+		label: "Read",
+		description: "Read one UTF-8 text file through the live gate manager.",
+		parameters: {
+			type: "object",
+			additionalProperties: false,
+			required: ["path"],
+			properties: { path: { type: "string" } },
+		},
+		executionMode: "parallel",
+	};
+	const codemodeTool = {
+		name: "codemode",
+		label: "Codemode",
+		description: "Run child-local codemode.",
+		parameters: { type: "object", properties: { code: { type: "string" } } },
+		executionMode: "sequential",
+	};
+	const managerTools = [readTool, codemodeTool];
+	const pi = {
+		registerTool(tool) { registeredTools.set(tool.name, tool); },
+		getActiveTools() { return managerTools.map((tool) => tool.name); },
+		getAllTools() {
+			return managerTools.map((tool) => ({
+				name: tool.name,
+				description: tool.description,
+				parameters: tool.parameters,
+				exposure: "direct",
+				annotations: { readOnlyHint: tool.name === "read" },
+				promptGuidelines: [],
+				sourceInfo: { path: `<gate:${tool.name}>`, source: "gate", scope: "temporary", origin: "top-level", baseDir: undefined },
+			}));
+		},
+		on(event, handler) {
+			const entries = handlers.get(event) ?? [];
+			entries.push(handler);
+			handlers.set(event, entries);
+		},
+	};
+	register(pi);
 
-	// Collect public LF-framed RPC events independently from the private boundary signal.
-	stdoutRecords = readStrictJsonl(child.stdout, (line) => {
-		if (!line.trim()) return;
-		const event = JSON.parse(line);
-		events.push(event);
-		if (event.type === "agent_settled") settledResolve();
-	});
-	// Surface malformed or unterminated child output during either gated wait without unhandled rejections.
-	const stdoutFramingFailure = new Promise((_, reject) => {
-		void stdoutRecords.catch(reject);
-	});
-	void stdoutFramingFailure.catch(() => undefined);
-	child.stderr.on("data", (chunk) => {
-		stderr += chunk.toString();
-	});
-	child.on("message", (message) => boundaries.push(message));
-
-	// Run one codemode batch that invokes the selected direct read tool from the script, then require the gate to settle.
-	child.stdin.write(`${JSON.stringify({
-		id: "probe-1",
-		type: "prompt",
-		message: `Call codemode exactly once. In its JavaScript source, call await tools.read({ path: ${JSON.stringify(readProbePath)} }); and then call text("pi-task-dispatcher-codemode-ready"). Do not call tools directly and do not make any other tool calls.`,
-	})}\n`);
-	await Promise.race([
-		settled,
-		stdoutFramingFailure,
-		new Promise((_, reject) => setTimeout(() => reject(new Error("First gated run did not settle.")), 120_000)),
-	]);
-
-	const firstAssistantMessages = events.filter((event) => event.type === "message_end" && event.message?.role === "assistant");
-	const firstBoundaryCount = boundaries.filter((message) => message?.type === "task_dispatcher_boundary").length;
-	if (firstBoundaryCount !== 1) throw new Error(`Expected one private boundary, observed ${firstBoundaryCount}.`);
-	if (!firstAssistantMessages.some((event) => event.message?.stopReason === "toolUse")) {
-		throw new Error("The first run did not execute the expected tool-use turn.");
-	}
-	if (!events.some((event) => event.type === "tool_execution_end" && event.toolName === "codemode" && !event.isError)) {
-		throw new Error("The isolated worker did not complete the selected native codemode tool.");
-	}
-	if (!events.some((event) => event.type === "tool_execution_end" && event.toolName === "read" && event.parentToolCallId)) {
-		throw new Error("The codemode script could not call the explicitly selected direct read tool.");
-	}
-	if (events.some((event) => event.type === "tool_execution_start" && event.toolName === "read" && !event.parentToolCallId)) {
-		throw new Error("The worker called read directly instead of routing it through codemode-only mode.");
-	}
-
-	// Continue in the same in-memory RPC session and require a normal final answer without another tool batch.
-	events.length = 0;
-	settled = new Promise((resolve) => {
-		settledResolve = resolve;
-	});
-	child.stdin.write(`${JSON.stringify({
-		id: "probe-2",
-		type: "prompt",
-		message: "Continue from the completed native codemode result. Do not call tools. Report only the exact marker produced by the script.",
-	})}\n`);
-	await Promise.race([
-		settled,
-		stdoutFramingFailure,
-		new Promise((_, reject) => setTimeout(() => reject(new Error("Continuation run did not settle.")), 120_000)),
-	]);
-
-	const finalText = events
-		.filter((event) => event.type === "message_end" && event.message?.role === "assistant")
-		.flatMap((event) => event.message.content ?? [])
-		.filter((part) => part.type === "text")
-		.map((part) => part.text)
-		.join("\n")
-		.trim();
-	if (!finalText.includes("pi-task-dispatcher-codemode-ready")) throw new Error(`Unexpected continuation output: ${finalText}`);
-
-	console.log(JSON.stringify({ firstBoundaryCount, firstAssistantMessages: firstAssistantMessages.length, finalText, nativeCodemodeOnly: true }, null, 2));
-	if (stderr.trim()) console.error(stderr.trim());
-} finally {
+	const managerCalls = [];
+	const context = {
+		cwd: projectRoot,
+		hasUI: false,
+		model,
+		thinkingLevel: process.env.PI_TASK_DISPATCHER_GATE_THINKING ?? process.env.PI_REASONING_LEVEL ?? "medium",
+		get tools() { return managerTools.filter((tool) => tool.name !== "codemode"); },
+		ui: { theme: { fg(_color, text) { return text; } }, setWidget() {}, setStatus() {} },
+		modelRegistry: {
+			find(provider, id) { return provider === model.provider && id === model.id ? model : undefined; },
+			hasConfiguredAuth() { return true; },
+		},
+		async executeTool(name, args, options) {
+			managerCalls.push({ name, args });
+			if (name !== "read") {
+				return { toolCall: { id: "gate-denied", name, arguments: args }, isError: true, result: { content: [{ type: "text", text: `Unexpected manager tool: ${name}` }], details: undefined } };
+			}
+			options?.onUpdate?.({ content: [{ type: "text", text: "manager read in progress" }], details: undefined });
+			try {
+				const text = await readFile(args.path, "utf8");
+				return { toolCall: { id: "gate-read", name, arguments: args }, isError: false, result: { content: [{ type: "text", text }], details: undefined } };
+			} catch (error) {
+				return { toolCall: { id: "gate-read", name, arguments: args }, isError: true, result: { content: [{ type: "text", text: String(error) }], details: undefined } };
+			}
+		},
+	};
+	const start = registeredTools.get("delegate_engineering");
+	const control = registeredTools.get("delegate_control");
+	assert(start && control, "The release extension did not register its engineering/control tools.");
+	const workload = { investigationUnits: 1, changeUnits: 0, verificationUnits: 1, expectedLongRunningSeconds: 0 };
+	const startAbort = new AbortController();
+	const startTimer = setTimeout(() => startAbort.abort(), 180_000);
+	let result;
 	try {
-		// Close the reusable child before validating that its final stdout tail was LF-framed.
-		if (child && child.exitCode === null && child.signalCode === null) {
-			child.stdin?.end();
-			await Promise.race([
-				new Promise((resolve) => child.once("close", resolve)),
-				new Promise((resolve) => setTimeout(resolve, 5_000)),
-			]);
-			if (child.exitCode === null && child.signalCode === null) child.kill("SIGKILL");
-		}
-		if (stdoutRecords) await stdoutRecords;
+		result = await start.execute(
+			"gate-start",
+			{
+				task: `Call codemode exactly once. In its JavaScript source, call await tools.read({ path: ${JSON.stringify(readProbePath)} }); verify the returned text contains ${marker}, then call text(${JSON.stringify(marker)}). Do not call tools directly or make any other tool calls. After that action batch, report only the marker.`,
+				tools: ["read", "codemode"],
+				workload,
+			},
+			startAbort.signal,
+			undefined,
+			context,
+		);
 	} finally {
-		// Remove only the runtime-controlled probe directory, even when stdout framing failed.
-		await rm(temporaryDirectory, { recursive: true, force: true });
+		clearTimeout(startTimer);
 	}
+	assert.equal(result.isError, false, result.content?.[0]?.text);
+	assert.equal(result.details.status, "paused", result.content?.[0]?.text);
+	assert.deepEqual(managerCalls, [{ name: "read", args: { path: readProbePath } }], "The child did not use the exact manager-proxied read grant once.");
+	assert(result.details.actionLedger.some((action) => action.toolName === "codemode"), "The live child did not execute native codemode.");
+	assert(result.details.actionLedger.some((action) => action.toolName === "read" && action.parentToolCallId), "Codemode did not execute read through the child proxy.");
+
+	const continueAbort = new AbortController();
+	const continueTimer = setTimeout(() => continueAbort.abort(), 180_000);
+	try {
+		result = await control.execute(
+			"gate-control",
+			{ jobId: result.details.jobId, action: "revise", instructions: `Do not call tools. Report only ${marker}.`, actionBatches: 1 },
+			continueAbort.signal,
+			undefined,
+			context,
+		);
+	} finally {
+		clearTimeout(continueTimer);
+	}
+	assert.equal(result.isError, false, result.content?.[0]?.text);
+	assert.equal(result.details.status, "completed", result.content?.[0]?.text);
+	assert.match(result.details.workerText, new RegExp(marker));
+	console.log(JSON.stringify({
+		model: `${model.provider}/${model.id}`,
+		status: result.details.status,
+		managerProxyCalls: managerCalls.length,
+		nativeCodemode: true,
+		finalText: result.details.workerText,
+	}, null, 2));
+} finally {
+	for (const handler of handlers.get("session_shutdown") ?? []) await handler();
+	delete process.env.PI_TASK_DISPATCHER_TEST_MODE;
+	delete process.env.PI_TASK_DISPATCHER_CONFIG_PATH;
+	delete process.env.PI_TASK_DISPATCHER_CLI_OVERRIDE;
+	if (inheritedWorkerRole === undefined) delete process.env.PI_TASK_DISPATCHER_WORKER;
+	else process.env.PI_TASK_DISPATCHER_WORKER = inheritedWorkerRole;
+	await rm(temporaryDirectory, { recursive: true, force: true });
 }

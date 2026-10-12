@@ -10,7 +10,7 @@ Each delegation runs in an isolated, in-memory Pi RPC session. After every cohes
 - **Enforced supervision:** a private parent-child IPC gate calls `ctx.abort()` after persisted tool results; pausing does not depend on the worker following a prompt.
 - **Explicit control:** continue, revise, recalculate, compact, checkpoint, cancel, or take over.
 - **Resumable context:** continuation uses the same in-memory worker session and completed tool results.
-- **Least privilege:** every start selects an exact isolated-worker tool allowlist; delegation tools and unrelated discovered extensions are unavailable to the worker. When explicitly selected, a runtime-temporary extension loads Pi's public native `codemode` factory in `only` mode; it is never injected otherwise.
+- **Manager-granted capabilities:** every start snapshots exact selected tools from the manager's current capabilities. Every selected non-`codemode` tool must be callable through `ctx.tools`/`ctx.executeTool()` and becomes a nonce-bound child proxy back to that manager path; unselected, recursive, replayed, cross-job, and paused requests fail closed. Active `codemode` is the deliberate exception: when explicitly selected, a runtime-temporary extension loads Pi's public native factory in `only` mode, and it is never injected otherwise.
 - **Model agnostic:** every role inherits Pi's active model and thinking level unless an explicit role override is configured.
 - **Formula-owned budgets:** the manager supplies semantic workload units, while the dispatcher calculates turn and time ceilings from workload, role, and delegated-model limits.
 - **Context insight:** boundary reports include worker context usage, compactions, turns, elapsed time, action counts, and recommendations.
@@ -23,7 +23,7 @@ Each delegation runs in an isolated, in-memory Pi RPC session. After every cohes
 - Node.js 22.19.0 or later
 - One active, authenticated Pi model; optional role-specific models must also be available and authenticated
 
-The supervision gate requires the parent Pi process and child Pi CLI to run under Node.js with an inherited IPC channel. The dispatcher fails closed when that boundary cannot be established; it does not fall back to prompt-only supervision. Worker processes disable ordinary extension discovery and load the generated supervision gate plus a generated native codemode-only extension only when that tool was explicitly selected.
+The supervision gate and manager-tool proxies require the parent Pi process and child Pi CLI to run under Node.js with an inherited IPC channel. The dispatcher fails closed when that boundary cannot be established; it does not fall back to prompt-only supervision or direct child access to manager capabilities. Worker processes disable ordinary extension discovery and load a generated proxy extension, the generated supervision gate, and a generated native codemode-only extension only when that tool was explicitly selected.
 
 ## Installation
 
@@ -64,10 +64,10 @@ The designer can inspect images with `read`, use image models through `codemode`
 Every role tool requires:
 
 - `task`: a self-contained objective, scope, constraints, and acceptance checks;
-- `tools`: the smallest exact allowlist selected from Pi's built-in tools and active for the main agent;
+- `tools`: the smallest exact capability grant selected from tools callable in the current manager context; this can include compatible extension-defined tools, but cannot include delegation tools or names unavailable through `ctx.executeTool()`—except active `codemode`, which is recreated child-locally;
 - `workload`: semantic estimates used by the deterministic budget formula.
 
-When `codemode` is active and delegated work materially benefits from JavaScript orchestration, batched/parallel/filtering of selected tools, or classifier/image models, include it in the delegated allowlist rather than reserving it for the manager. Also include each direct tool its script must call; otherwise omit `codemode`.
+When `codemode` is active and delegated work materially benefits from JavaScript orchestration, batched/parallel/filtering of selected tools, or classifier/image models, include it in the delegated capability grant rather than reserving it for the manager. Also include each selected tool its script must call through the child proxy; otherwise omit `codemode`.
 
 ```json
 {
@@ -91,7 +91,7 @@ A workload unit is intentionally semantic:
 
 At least one investigation, change, or verification unit is required.
 
-Isolated workers accept `read`, `bash`, `powershell`, `edit`, `write`, `grep`, `find`, `ls`, and `codemode` when the selected tools are also active in the main Pi session. If `codemode` is selected, the child generates a temporary extension using Pi's public `createCodemodeExtension({ mode: "only" })` API while ordinary extension discovery remains disabled. This makes `codemode` model-visible without exposing selected direct tools to the worker model; its scripts can still call those selected callable tools and the non-LLM model catalog. Unrelated manager extensions and delegation tools remain unavailable.
+The worker receives exactly the selected capability names: manager-callable tools plus active `codemode` when requested. For every selected name except `codemode`, a generated child extension recreates the public tool metadata and sends execution through a private nonce-bound IPC proxy to the manager's `ctx.executeTool()` path, so manager validation, hooks, policy, and nested usage accounting remain authoritative. Calls that a selected manager tool makes transitively are blocked unless their names are also in the same grant. Proxy manifests, individual arguments/results, concurrent requests, and total per-job requests have fixed limits and fail closed when exceeded. The proxy grant is rebuilt and definition-fingerprinted before continuation; a changed or unavailable callable tool hard-stops the job rather than weakening the original grant. If `codemode` is selected, the child additionally generates a temporary extension using Pi's public `createCodemodeExtension({ mode: "only" })` API while ordinary extension discovery remains disabled. This makes `codemode` model-visible; its scripts can call only selected proxied tools and the non-LLM model catalog. Unrelated manager extensions and delegation tools remain unavailable.
 
 The current formula derives planned work turns from those units, applies a role factor and a bounded scale based on the selected delegated model's own context window, reserves two additional turns for synthesis or recovery, then derives active execution time from calculated turns plus expected long-running time. Administrative ceilings always win. Formula inputs and results are returned in every state report so they can be reviewed and recalculated. Time spent paused for manager deliberation does not consume the active execution budget.
 
@@ -143,7 +143,7 @@ A paused result contains:
 - a session-local sequential identity such as `engineer-2`, plus role, model, and status;
 - the delegated task and live command or tool activity while execution is running;
 - boundary sequence and current phase;
-- completed, failed, and potentially mutating action counts;
+- completed, failed, and potentially mutating action counts, where only an explicit tool `annotations.readOnlyHint: true` is classified as non-mutating;
 - recent bounded activity labels in completion order and image-output MIME/size metadata without retained base64 payloads;
 - active elapsed time and turns against calculated budgets;
 - context tokens, context window, percentage, and compaction counts;
@@ -209,8 +209,9 @@ Version 3 intentionally ignores the version 2 fields `maxTurns`, `timeoutSeconds
 - A parent-operation abort stops the active worker stage.
 - A paused lease eventually closes an abandoned worker.
 - Session shutdown or extension reload disposes the child and runtime-controlled temporary files.
-- Worker process failures reject pending RPC operations and produce a failed state.
-- Worker role instructions and the supervision gate exist only in a runtime-controlled temporary directory.
+- Worker process failures reject pending RPC operations and revoke every in-flight manager proxy execution.
+- A manager executor lease exists only while `delegate_*` start or `delegate_control` continuation is running; returning paused or terminal state aborts remaining proxied executions.
+- Worker role instructions, the tool-proxy extension, and the supervision gate exist only in a runtime-controlled temporary directory.
 - The selected native codemode-only extension may create runtime-temporary image outputs; the designer must persist requested outputs explicitly before completion.
 - The worker uses `--no-session`; no worker session file is persisted.
 
@@ -223,7 +224,7 @@ npm run check
 npm run test:gate
 ```
 
-`check` runs static release invariants and deterministic fake-RPC lifecycle and renderer scenarios. The fake child verifies all role registrations, pause/resume, output-limit recovery, usage deltas, native codemode-only loading and nested direct-tool usage accounting, media metadata without base64 retention, streaming assistant/tool replacement semantics, five-visual-row previews with native expansion hints, complete expanded presentation beyond the 5,000-character model preview, persistent per-role footer state, full action-ledger retention, intercepted prompts, missing-boundary failure, fail-closed timeouts, pre-aborted operations, partial argument rendering, stable repeated rendering, and manager-state transitions without a model request.
+`check` runs static release invariants and deterministic fake-RPC lifecycle and renderer scenarios. The fake child verifies exact manager capability grants, extension-defined tools, built-in-name manager overrides, transitive-call confinement, codemode-only loading, proxy streaming/results/usage stripping, images and structured content, concurrent manager execution, nonce/name/replay/paused-request rejection, continuation revalidation, cancellation, child-exit/session-shutdown cleanup, pause/resume, output-limit recovery, presentation compaction, and existing fail-closed lifecycle paths without a model request.
 
-`test:gate` performs a small live model integration check with the active parent model exported by Pi through `PI_PROVIDER`, `PI_MODEL`, and `PI_REASONING_LEVEL`, falling back to Pi's configured default when those values are unavailable; it contains no provider or model assumption. Optional `PI_TASK_DISPATCHER_GATE_MODEL` and `PI_TASK_DISPATCHER_GATE_THINKING` overrides are available for explicit test matrices. The probe verifies generated native codemode-only loading, a codemode script calling an explicitly selected direct `read` tool, a private pause after that completed batch, and subsequent completion in the same in-memory child. It requires configured credentials and therefore is not a hermetic unit test.
+`test:gate` loads the release extension and performs a small live model integration check with the active parent model exported by Pi through `PI_PROVIDER`, `PI_MODEL`, and `PI_REASONING_LEVEL`, falling back to the first available model listed by Pi when those values are unavailable; it contains no provider assumption. Optional `PI_TASK_DISPATCHER_GATE_MODEL` and `PI_TASK_DISPATCHER_GATE_THINKING` overrides are available for explicit test matrices. The probe verifies generated native codemode-only loading, a codemode script calling `read` through the manager proxy exactly once, a private pause after that completed batch, and subsequent completion in the same in-memory child. It requires configured credentials and therefore is not a hermetic unit test.
 

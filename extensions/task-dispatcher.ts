@@ -3,6 +3,7 @@
  */
 
 import { spawn, type ChildProcess } from "node:child_process";
+import { randomBytes } from "node:crypto";
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
@@ -214,6 +215,56 @@ interface GateBoundaryMessage {
 	toolResults: number;
 }
 
+type JsonValue = null | boolean | number | string | JsonValue[] | { [key: string]: JsonValue };
+
+interface ToolNamespaceManifest {
+	name: string;
+	description?: string;
+	instructions?: string;
+}
+
+interface ToolAnnotationsManifest {
+	readOnlyHint?: boolean;
+	destructiveHint?: boolean;
+	idempotentHint?: boolean;
+	openWorldHint?: boolean;
+}
+
+/** A JSON-safe snapshot of one exact manager capability granted to a worker. */
+interface DelegatedToolManifest {
+	name: string;
+	label: string;
+	description: string;
+	parameters: { [key: string]: JsonValue };
+	outputSchema?: JsonValue;
+	namespace?: ToolNamespaceManifest;
+	annotations?: ToolAnnotationsManifest;
+	promptGuidelines?: string[];
+	executionMode?: "sequential" | "parallel";
+	fingerprint: string;
+}
+
+/** The only model-facing fields that cross the private proxy IPC boundary. */
+interface ProxyWireResult {
+	content: JsonValue[];
+	structuredContent?: JsonValue;
+	isError?: boolean;
+	terminate?: boolean;
+}
+
+interface ExecutorLease {
+	generation: number;
+	rootToolCallId: string;
+	ctx: ExtensionToolContext;
+	signal: AbortSignal | undefined;
+}
+
+interface ProxyRequestState {
+	lease: ExecutorLease;
+	controller: AbortController;
+	removeParentAbort: (() => void) | undefined;
+}
+
 type EventUsage = Partial<UsageTotals> & { cost?: Partial<UsageTotals["cost"]> };
 
 const TEST_MODE = process.env.PI_TASK_DISPATCHER_TEST_MODE === "1";
@@ -226,10 +277,13 @@ const MODEL_TEXT_LIMIT = 5_000;
 const PRESENTATION_PREVIEW_ROWS = 5;
 const PRESENTATION_UPDATE_THROTTLE_MS = 100;
 const STDERR_LIMIT = 16_000;
+const PROXY_PAYLOAD_LIMIT_BYTES = 16 * 1024 * 1024;
+const PROXY_MANIFEST_LIMIT_BYTES = 8 * 1024 * 1024;
+const PROXY_MAX_IN_FLIGHT_REQUESTS = 32;
+const PROXY_MAX_REQUESTS_PER_JOB = 4_096;
+const REVOKED_EXECUTOR_ROOT_LIMIT = 4_096;
 const THINKING_LEVELS = new Set<ThinkingLevel>(["off", "minimal", "low", "medium", "high", "xhigh", "max"]);
 const ROLES: Role[] = ["mechanic", "assistant", "engineer", "designer"];
-const MUTATING_TOOLS = new Set(["edit", "write", "bash", "powershell", "codemode"]);
-const ISOLATED_WORKER_TOOLS = new Set(["read", "bash", "powershell", "edit", "write", "grep", "find", "ls", "codemode"]);
 
 const DEFAULT_CONFIG: DispatcherConfig = {
 	mechanic: {},
@@ -315,6 +369,81 @@ const StatusParams = Type.Object({
 /** Identify plain objects before reading configuration and RPC data. */
 function isRecord(value: unknown): value is Record<string, unknown> {
 	return typeof value === "object" && value !== null && !Array.isArray(value);
+}
+
+/**
+ * Copy the JSON-visible surface of a schema or result without silently dropping unsupported values.
+ * TypeBox's own symbol markers are deliberately excluded: they are not model-facing JSON Schema.
+ */
+function cloneJsonValue(value: unknown, label: string): JsonValue {
+	const seen = new WeakSet<object>();
+	const visit = (candidate: unknown, location: string): JsonValue => {
+		if (candidate === null || typeof candidate === "string" || typeof candidate === "boolean") return candidate;
+		if (typeof candidate === "number") {
+			if (!Number.isFinite(candidate) || Object.is(candidate, -0)) throw new Error(`${label} is not JSON-serializable at ${location}`);
+			return candidate;
+		}
+		if (Array.isArray(candidate)) {
+			if (seen.has(candidate)) throw new Error(`${label} contains a cycle at ${location}`);
+			seen.add(candidate);
+			const result = candidate.map((item, index) => visit(item, `${location}[${index}]`));
+			seen.delete(candidate);
+			return result;
+		}
+		if (!isRecord(candidate)) throw new Error(`${label} is not JSON-serializable at ${location}`);
+		if (seen.has(candidate)) throw new Error(`${label} contains a cycle at ${location}`);
+		const prototype = Object.getPrototypeOf(candidate);
+		if (prototype !== Object.prototype && prototype !== null) throw new Error(`${label} has an unsupported object at ${location}`);
+		const unsupportedSymbols = Object.getOwnPropertySymbols(candidate)
+			.filter((symbol) => Object.prototype.propertyIsEnumerable.call(candidate, symbol))
+			.filter((symbol) => !String(symbol).startsWith("Symbol(TypeBox."));
+		if (unsupportedSymbols.length > 0) throw new Error(`${label} has an unsupported symbol at ${location}`);
+		seen.add(candidate);
+		const result: { [key: string]: JsonValue } = {};
+		for (const key of Object.keys(candidate)) {
+			const descriptor = Object.getOwnPropertyDescriptor(candidate, key);
+			if (!descriptor || !("value" in descriptor)) throw new Error(`${label} has an accessor at ${location}.${key}`);
+			result[key] = visit(descriptor.value, `${location}.${key}`);
+		}
+		seen.delete(candidate);
+		return result;
+	};
+	return visit(value, "$" );
+}
+
+/** Produce a deterministic compatibility fingerprint without changing the model-facing field order. */
+function stableJson(value: JsonValue): string {
+	if (value === null || typeof value !== "object") return JSON.stringify(value);
+	if (Array.isArray(value)) return `[${value.map((item) => stableJson(item)).join(",")}]`;
+	return `{${Object.keys(value).sort().map((key) => `${JSON.stringify(key)}:${stableJson(value[key])}`).join(",")}}`;
+}
+
+/** Reject an otherwise JSON-safe proxy value before it can create an unbounded IPC message. */
+function assertJsonByteLimit(value: JsonValue, label: string, maximum: number): void {
+	const bytes = Buffer.byteLength(JSON.stringify(value), "utf8");
+	if (bytes > maximum) throw new Error(`${label} exceeds the ${maximum}-byte proxy limit`);
+}
+
+/** Return a failure result that is safe to send over the proxy channel. */
+function proxyErrorResult(message: string): ProxyWireResult {
+	return { content: [{ type: "text", text: message }], isError: true };
+}
+
+/** Strip parent-only details and usage before a nested manager result reaches the child session. */
+function serializeProxyResult(value: unknown, forceError = false): ProxyWireResult {
+	if (!isRecord(value) || !Array.isArray(value.content)) return proxyErrorResult("Manager tool returned an invalid result.");
+	try {
+		const result: ProxyWireResult = { content: cloneJsonValue(value.content, "manager tool content") as JsonValue[] };
+		if (Object.prototype.hasOwnProperty.call(value, "structuredContent")) {
+			result.structuredContent = cloneJsonValue(value.structuredContent, "manager tool structured content");
+		}
+		if (value.isError === true || forceError) result.isError = true;
+		if (value.terminate === true) result.terminate = true;
+		assertJsonByteLimit(result as unknown as JsonValue, "manager tool result", PROXY_PAYLOAD_LIMIT_BYTES);
+		return result;
+	} catch (error) {
+		return proxyErrorResult(`Manager tool result could not be serialized: ${error instanceof Error ? error.message : String(error)}`);
+	}
 }
 
 /** Create a fresh usage accumulator for one worker job. */
@@ -536,6 +665,132 @@ export default function codemodeOnlyExtension(pi: ExtensionAPI): void {
 `;
 }
 
+/** Build a child-local proxy for exactly the manager tools granted to this job. */
+function proxyExtensionSource(manifests: readonly DelegatedToolManifest[], nonce: string): string {
+	const tools = manifests
+		.filter((manifest) => manifest.name !== "codemode")
+		.map(({ fingerprint: _fingerprint, ...manifest }) => manifest);
+	const configuration = JSON.stringify({ nonce, tools });
+	return `/** Route selected worker tool calls through the parent manager's current ExtensionToolContext. */
+import { Type } from "typebox";
+import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
+
+type WireResult = { content: unknown[]; structuredContent?: unknown; isError?: boolean; terminate?: boolean };
+type ProxyTool = {
+	name: string;
+	label: string;
+	description: string;
+	parameters: Record<string, unknown>;
+	outputSchema?: unknown;
+	namespace?: { name: string; description?: string; instructions?: string };
+	annotations?: { readOnlyHint?: boolean; destructiveHint?: boolean; idempotentHint?: boolean; openWorldHint?: boolean };
+	promptGuidelines?: string[];
+	executionMode?: "sequential" | "parallel";
+};
+const configuration = ${configuration} as { nonce: string; tools: ProxyTool[] };
+const payloadLimitBytes = ${PROXY_PAYLOAD_LIMIT_BYTES};
+const maximumInFlightRequests = ${PROXY_MAX_IN_FLIGHT_REQUESTS};
+const textEncoder = new TextEncoder();
+const pending = new Map<string, { resolve: (result: any) => void; onUpdate: ((result: any) => void) | undefined; signal: AbortSignal | undefined; onAbort: (() => void) | undefined }>();
+let requestSequence = 0;
+
+function failure(message: string): any {
+	return { content: [{ type: "text", text: message }], details: undefined, isError: true };
+}
+
+function resultFromWire(value: unknown): any {
+	if (!value || typeof value !== "object" || Array.isArray(value)) return failure("Dispatcher proxy received an invalid manager result.");
+	try {
+		const encoded = JSON.stringify(value);
+		if (encoded === undefined || textEncoder.encode(encoded).byteLength > payloadLimitBytes) return failure("Dispatcher proxy received an oversized manager result.");
+	} catch {
+		return failure("Dispatcher proxy received a non-serializable manager result.");
+	}
+	const wire = value as WireResult;
+	if (!Array.isArray(wire.content)) return failure("Dispatcher proxy received a manager result without content.");
+	const result: any = { content: wire.content, details: undefined };
+	if (Object.prototype.hasOwnProperty.call(wire, "structuredContent")) result.structuredContent = wire.structuredContent;
+	if (wire.isError === true) result.isError = true;
+	if (wire.terminate === true) result.terminate = true;
+	return result;
+}
+
+function send(message: Record<string, unknown>): void {
+	if (typeof process.send !== "function") throw new Error("Task dispatcher proxy IPC is unavailable.");
+	process.send(message);
+}
+
+function finish(requestId: string, result: any): void {
+	const request = pending.get(requestId);
+	if (!request) return;
+	pending.delete(requestId);
+	if (request.signal && request.onAbort) request.signal.removeEventListener("abort", request.onAbort);
+	request.resolve(result);
+}
+
+process.on("message", (incoming: unknown) => {
+	if (!incoming || typeof incoming !== "object" || Array.isArray(incoming)) return;
+	const message = incoming as Record<string, unknown>;
+	if (message.nonce !== configuration.nonce || typeof message.requestId !== "string") return;
+	if (message.type === "task_dispatcher_proxy_update") {
+		const request = pending.get(message.requestId);
+		if (!request) return;
+		try { request.onUpdate?.(resultFromWire(message.result)); } catch { /* A renderer must not affect proxy control flow. */ }
+		return;
+	}
+	if (message.type === "task_dispatcher_proxy_result") finish(message.requestId, resultFromWire(message.result));
+});
+process.on("disconnect", () => {
+	for (const requestId of [...pending.keys()]) finish(requestId, failure("Task dispatcher parent IPC disconnected."));
+});
+
+export default function taskDispatcherProxy(pi: ExtensionAPI): void {
+	for (const manifest of configuration.tools) {
+		pi.registerTool({
+			name: manifest.name,
+			label: manifest.label,
+			description: manifest.description,
+			parameters: Type.Unsafe(manifest.parameters) as any,
+			...(manifest.outputSchema === undefined ? {} : { outputSchema: Type.Unsafe(manifest.outputSchema) as any }),
+			...(manifest.namespace === undefined ? {} : { namespace: manifest.namespace }),
+			...(manifest.annotations === undefined ? {} : { annotations: manifest.annotations }),
+			...(manifest.promptGuidelines === undefined ? {} : { promptGuidelines: manifest.promptGuidelines }),
+			...(manifest.executionMode === undefined ? {} : { executionMode: manifest.executionMode }),
+			exposure: "direct",
+			defaultActive: true,
+			async execute(_toolCallId, args, signal, onUpdate) {
+				if (signal?.aborted) return failure("Worker proxy call was already aborted.");
+				if (pending.size >= maximumInFlightRequests) return failure("Worker proxy has too many in-flight manager requests.");
+				let serializedArgs: unknown;
+				try {
+					const encoded = JSON.stringify(args);
+					if (encoded === undefined) throw new Error("arguments are not JSON-serializable");
+					if (textEncoder.encode(encoded).byteLength > payloadLimitBytes) throw new Error("arguments exceed the " + payloadLimitBytes + "-byte proxy limit");
+					serializedArgs = JSON.parse(encoded);
+				} catch (error) {
+					return failure("Worker proxy arguments could not be serialized: " + (error instanceof Error ? error.message : String(error)));
+				}
+				const requestId = "proxy-" + (++requestSequence);
+				return await new Promise<any>((resolve) => {
+					const onAbort = () => {
+						try { send({ type: "task_dispatcher_proxy_cancel", nonce: configuration.nonce, requestId }); } catch { /* Parent teardown wins. */ }
+						finish(requestId, failure("Worker proxy call was aborted."));
+					};
+					pending.set(requestId, { resolve, onUpdate, signal, onAbort });
+					signal?.addEventListener("abort", onAbort, { once: true });
+					try {
+						send({ type: "task_dispatcher_proxy_request", nonce: configuration.nonce, requestId, toolName: manifest.name, args: serializedArgs });
+					} catch (error) {
+						finish(requestId, failure("Task dispatcher proxy request failed: " + (error instanceof Error ? error.message : String(error))));
+					}
+				});
+			},
+		});
+	}
+}
+`;
+}
+
 /** Build the worker-only gate extension that stops the agent loop after persisted tool results. */
 function gateSource(): string {
 	return `/** Pause this worker after each persisted tool batch so only the parent dispatcher can resume it. */
@@ -560,6 +815,33 @@ function isTerminal(status: JobStatus): boolean {
 }
 
 let nextJobIndex = 1;
+const revokedExecutorRoots = new Set<string>();
+let revokedExecutorGuardSaturated = false;
+
+/** Bound stale-lease tracking and fail every otherwise-unattributed nested call after saturation. */
+function revokeExecutorRoot(rootToolCallId: string): void {
+	if (revokedExecutorGuardSaturated) return;
+	if (revokedExecutorRoots.size >= REVOKED_EXECUTOR_ROOT_LIMIT) {
+		revokedExecutorRoots.clear();
+		revokedExecutorGuardSaturated = true;
+		return;
+	}
+	revokedExecutorRoots.add(rootToolCallId);
+}
+
+/** Reject a nested manager call attributable to a revoked lease. */
+function revokedExecutorDecision(parentToolCallId: string | undefined, toolName: string): { block: boolean; reason: string } | undefined {
+	if (!parentToolCallId) return undefined;
+	if (revokedExecutorGuardSaturated) {
+		return { block: true, reason: `Nested manager tool ${toolName} was rejected because stale-lease tracking reached its fail-closed limit.` };
+	}
+	for (const rootToolCallId of revokedExecutorRoots) {
+		if (parentToolCallId === rootToolCallId || parentToolCallId.startsWith(`${rootToolCallId}/`)) {
+			return { block: true, reason: `Nested manager tool ${toolName} was rejected because its executor lease is no longer active.` };
+		}
+	}
+	return undefined;
+}
 
 /** Supervise one reusable in-memory Pi worker and expose only boundary-sized state. */
 class WorkerJob {
@@ -567,6 +849,7 @@ class WorkerJob {
 	readonly role: Role;
 	readonly task: string;
 	readonly tools: string[];
+	readonly manifests: readonly DelegatedToolManifest[];
 	readonly model: string;
 	readonly thinking: ThinkingLevel;
 	readonly cwd: string;
@@ -576,6 +859,10 @@ class WorkerJob {
 	readonly usage = emptyUsage();
 	readonly actions: WorkerAction[] = [];
 	readonly context: ContextMetrics;
+	private readonly pi: ExtensionAPI;
+	private readonly manifestByName: ReadonlyMap<string, DelegatedToolManifest>;
+	private readonly callableIdentityByName: ReadonlyMap<string, unknown>;
+	private readonly proxyNonce = randomBytes(24).toString("hex");
 
 	status: JobStatus = "starting";
 	sequence = 0;
@@ -587,6 +874,7 @@ class WorkerJob {
 
 	private child: ChildProcess | undefined;
 	private temporaryDirectory: string | undefined;
+	private temporaryRemoval: Promise<void> | undefined;
 	private stdoutBuffer = "";
 	private stderr = "";
 	private requestSequence = 0;
@@ -610,25 +898,35 @@ class WorkerJob {
 	private progressUpdate: ReturnType<typeof setTimeout> | undefined;
 	private pausedLease: ReturnType<typeof setTimeout> | undefined;
 	private closePromise: Promise<void> | undefined;
+	private executorLease: ExecutorLease | undefined;
+	private executorLeaseSequence = 0;
+	private readonly proxyRequests = new Map<string, ProxyRequestState>();
+	private readonly seenProxyRequests = new Set<string>();
 
 	constructor(
 		role: Role,
 		task: string,
-		tools: string[],
+		manifests: DelegatedToolManifest[],
 		config: ResolvedWorkerRoleConfig,
 		cwd: string,
 		policy: DispatcherPolicy,
 		budget: CalculatedBudget,
+		pi: ExtensionAPI,
+		callableTools: ExtensionToolContext["tools"],
 	) {
 		this.id = `${role}-${nextJobIndex++}`;
 		this.role = role;
 		this.task = task;
-		this.tools = tools;
+		this.manifests = manifests.map((manifest) => structuredClone(manifest));
+		this.tools = this.manifests.map((manifest) => manifest.name);
+		this.manifestByName = new Map(this.manifests.map((manifest) => [manifest.name, manifest]));
+		this.callableIdentityByName = new Map(callableTools.map((tool) => [tool.name, tool]));
 		this.model = config.model;
 		this.thinking = config.thinking;
 		this.cwd = cwd;
 		this.policy = policy;
 		this.budget = budget;
+		this.pi = pi;
 		this.context = {
 			contextWindow: budget.contextWindow,
 			peakPercent: 0,
@@ -640,12 +938,14 @@ class WorkerJob {
 	}
 
 	/** Start the isolated child, initialize compaction policy, and execute the first supervised stage. */
-	async start(signal: AbortSignal | undefined, onProgress: (snapshot: WorkerSnapshot) => void): Promise<WorkerSnapshot> {
+	async start(rootToolCallId: string, signal: AbortSignal | undefined, onProgress: (snapshot: WorkerSnapshot) => void, ctx: ExtensionToolContext): Promise<WorkerSnapshot> {
 		this.temporaryDirectory = await fs.promises.mkdtemp(path.join(os.tmpdir(), "pi-task-dispatcher-"));
 		const rolePromptPath = path.join(this.temporaryDirectory, `${this.role}.md`);
+		const proxyPath = path.join(this.temporaryDirectory, "tool-proxies.ts");
 		const gatePath = path.join(this.temporaryDirectory, "supervision-gate.ts");
 		const codemodeOnlyPath = path.join(this.temporaryDirectory, "codemode-only.ts");
 		await fs.promises.writeFile(rolePromptPath, ROLE_PROMPTS[this.role], { encoding: "utf8", mode: 0o600 });
+		await fs.promises.writeFile(proxyPath, proxyExtensionSource(this.manifests, this.proxyNonce), { encoding: "utf8", mode: 0o600 });
 		await fs.promises.writeFile(gatePath, gateSource(), { encoding: "utf8", mode: 0o600 });
 		if (this.tools.includes("codemode")) {
 			await fs.promises.writeFile(codemodeOnlyPath, codemodeOnlySource(), { encoding: "utf8", mode: 0o600 });
@@ -659,6 +959,7 @@ class WorkerJob {
 			"--thinking", this.thinking,
 			...(this.tools.length > 0 ? ["--tools", this.tools.join(",")] : ["--no-tools"]),
 			"--append-system-prompt", rolePromptPath,
+			"--extension", proxyPath,
 			...(this.tools.includes("codemode") ? ["--extension", codemodeOnlyPath] : []),
 			"--extension", gatePath,
 		];
@@ -676,23 +977,32 @@ class WorkerJob {
 		} finally {
 			this.commitActiveElapsed();
 		}
-		return await this.runStages(`Delegated ${this.role} task:\n${this.task}`, 1, signal, onProgress);
+		return await this.runStages(`Delegated ${this.role} task:\n${this.task}`, 1, rootToolCallId, signal, onProgress, ctx);
 	}
 
 	/** Continue or revise work for a bounded number of action batches. */
 	async continue(
 		instructions: string | undefined,
 		actionBatches: number,
+		rootToolCallId: string,
 		signal: AbortSignal | undefined,
 		onProgress: (snapshot: WorkerSnapshot) => void,
+		ctx: ExtensionToolContext,
 	): Promise<WorkerSnapshot> {
 		if (this.status !== "paused") throw new Error(`Job ${this.id} is ${this.status}, not paused.`);
+		try {
+			this.revalidateManifest(ctx);
+		} catch (error) {
+			const reason = `Delegated tool manifest revalidation failed: ${error instanceof Error ? error.message : String(error)}`;
+			await this.stop("hard_stopped", reason);
+			throw new Error(reason);
+		}
 		this.clearPausedLease();
 		const message = instructions
 			? `The manager revised the delegated task with these controlling instructions:\n${instructions}\nContinue from completed work without repeating it.`
 			: "Continue the delegated task from the completed tool results. Do not repeat completed work.";
 		try {
-			return await this.runStages(message, actionBatches, signal, onProgress);
+			return await this.runStages(message, actionBatches, rootToolCallId, signal, onProgress, ctx);
 		} catch (error) {
 			if (this.status === "paused") this.schedulePausedLease();
 			throw error;
@@ -752,6 +1062,7 @@ class WorkerJob {
 	/** End the job from parent-observed state without asking the worker to cooperate. */
 	async stop(status: Extract<JobStatus, "checkpointed" | "taken_over" | "cancelled" | "hard_stopped">, reason: string): Promise<WorkerSnapshot> {
 		this.clearPausedLease();
+		this.clearExecutorLease();
 		this.status = status;
 		this.phase = reason;
 		this.recommendation = status === "taken_over" ? "manager owns remaining work" : "closed";
@@ -810,6 +1121,7 @@ class WorkerJob {
 	async dispose(): Promise<void> {
 		if (this.closePromise) return await this.closePromise;
 		this.clearPausedLease();
+		this.clearExecutorLease();
 		if (this.progressUpdate) clearTimeout(this.progressUpdate);
 		this.progressUpdate = undefined;
 		this.closePromise = (async () => {
@@ -820,7 +1132,13 @@ class WorkerJob {
 					new Promise<void>((resolve) => child.once("close", () => resolve())),
 					new Promise<void>((resolve) => setTimeout(resolve, 5_000)),
 				]);
-				if (child.exitCode === null && child.signalCode === null) child.kill("SIGKILL");
+				if (child.exitCode === null && child.signalCode === null) {
+					child.kill("SIGKILL");
+					await Promise.race([
+						new Promise<void>((resolve) => child.once("close", () => resolve())),
+						new Promise<void>((resolve) => setTimeout(resolve, 1_000)),
+					]);
+				}
 			}
 			await this.removeTemporaryDirectory();
 		})();
@@ -850,12 +1168,20 @@ class WorkerJob {
 		});
 		child.on("message", (message) => {
 			this.lastProgressAt = Date.now();
-			if (!isRecord(message) || message.type !== "task_dispatcher_boundary") return;
-			const boundary = message as unknown as GateBoundaryMessage;
-			this.boundaryObserved = true;
-			this.sequence++;
-			this.phase = `completed tool batch at worker turn ${boundary.turnIndex}`;
-			this.boundaryWaiter?.resolve();
+			if (!isRecord(message)) return;
+			if (message.type === "task_dispatcher_boundary") {
+				const boundary = message as unknown as GateBoundaryMessage;
+				this.boundaryObserved = true;
+				this.sequence++;
+				this.phase = `completed tool batch at worker turn ${boundary.turnIndex}`;
+				this.boundaryWaiter?.resolve();
+				return;
+			}
+			if (message.type === "task_dispatcher_proxy_request") {
+				void this.handleProxyRequest(message);
+				return;
+			}
+			if (message.type === "task_dispatcher_proxy_cancel") void this.handleProxyCancel(message);
 		});
 		child.on("error", (error) => {
 			this.diagnostic = error.message;
@@ -925,7 +1251,7 @@ class WorkerJob {
 				toolCallId: event.toolCallId,
 				toolName: event.toolName,
 				label: formatActivity(event.toolName, event.args),
-				mutating: MUTATING_TOOLS.has(event.toolName),
+				mutating: this.manifestByName.get(event.toolName)?.annotations?.readOnlyHint !== true,
 				status: "running",
 				startedAt: Date.now(),
 				parentToolCallId: event.parentToolCallId,
@@ -1078,10 +1404,14 @@ class WorkerJob {
 	private async runStages(
 		initialMessage: string,
 		actionBatches: number,
+		rootToolCallId: string,
 		signal: AbortSignal | undefined,
 		onProgress: (snapshot: WorkerSnapshot) => void,
+		ctx: ExtensionToolContext,
 	): Promise<WorkerSnapshot> {
-		let message = initialMessage;
+		const lease = this.openExecutorLease(rootToolCallId, ctx, signal);
+		try {
+			let message = initialMessage;
 		for (let batch = 0; batch < actionBatches; batch++) {
 			this.assertBudget();
 			const actionBaseline = this.actionSequence;
@@ -1165,7 +1495,10 @@ class WorkerJob {
 			this.schedulePausedLease();
 			return this.snapshot();
 		}
-		throw new Error("Unreachable supervised stage state.");
+			throw new Error("Unreachable supervised stage state.");
+		} finally {
+			this.clearExecutorLease(lease);
+		}
 	}
 
 	/** Wait for settlement while enforcing job deadline and no-progress policy externally. */
@@ -1229,6 +1562,191 @@ class WorkerJob {
 		return "continue, revise, compact, checkpoint, cancel, or take over";
 	}
 
+	/** Rebuild the grant from this invocation's callable manager tools before a worker can resume. */
+	private revalidateManifest(ctx: ExtensionToolContext): void {
+		const current = buildDelegatedToolManifests(this.tools, this.pi, ctx);
+		if (current.length !== this.manifests.length) throw new Error("the selected tool count changed");
+		const currentIdentities = new Map(ctx.tools.map((tool) => [tool.name, tool]));
+		for (let index = 0; index < current.length; index++) {
+			const expected = this.manifests[index];
+			const observed = current[index];
+			if (expected.name !== observed.name || expected.fingerprint !== observed.fingerprint) {
+				throw new Error(`selected tool ${expected.name} is no longer definition-compatible`);
+			}
+			if (expected.name !== "codemode" && this.callableIdentityByName.get(expected.name) !== currentIdentities.get(expected.name)) {
+				throw new Error(`selected tool ${expected.name} no longer has the original callable identity`);
+			}
+		}
+	}
+
+	/** Enforce selected capabilities during a lease and reject delayed calls from every revoked lease. */
+	authorizeNestedToolCall(_toolCallId: string, parentToolCallId: string | undefined, toolName: string): { block: boolean; reason: string } | undefined {
+		if (!parentToolCallId) return undefined;
+		const lease = this.executorLease;
+		if (lease && (parentToolCallId === lease.rootToolCallId || parentToolCallId.startsWith(`${lease.rootToolCallId}/`))) {
+			if (toolName === "codemode" || !this.manifestByName.has(toolName)) {
+				return { block: true, reason: `Nested manager tool ${toolName} is outside this delegation's selected capability grant.` };
+			}
+			return undefined;
+		}
+		return revokedExecutorDecision(parentToolCallId, toolName);
+	}
+
+	/** Grant parent execution only while a start or continuation call actively owns the worker. */
+	private openExecutorLease(rootToolCallId: string, ctx: ExtensionToolContext, signal: AbortSignal | undefined): ExecutorLease {
+		if (this.executorLease) throw new Error("A manager executor lease is already active for this worker.");
+		const lease: ExecutorLease = { generation: ++this.executorLeaseSequence, rootToolCallId, ctx, signal };
+		this.executorLease = lease;
+		return lease;
+	}
+
+	/** Revoke parent execution before exposing an idle, paused, or terminal worker state. */
+	private clearExecutorLease(expected?: ExecutorLease): void {
+		if (expected && this.executorLease !== expected) return;
+		const lease = this.executorLease;
+		if (!lease) return;
+		this.executorLease = undefined;
+		revokeExecutorRoot(lease.rootToolCallId);
+		for (const [requestId, request] of this.proxyRequests) {
+			if (request.lease !== lease) continue;
+			this.proxyRequests.delete(requestId);
+			request.removeParentAbort?.();
+			request.removeParentAbort = undefined;
+			request.controller.abort();
+		}
+	}
+
+	/** Deliver a nonce-bound manager result or streaming update to the private child proxy. */
+	private sendProxy(message: Record<string, unknown>): void {
+		try {
+			if (this.child?.connected) this.child.send(message);
+		} catch {
+			// Child teardown wins over a late nested-tool result.
+		}
+	}
+
+	/** Reject a malformed, stale, replayed, cross-job, or otherwise unauthorized proxy call. */
+	private rejectProxyRequest(requestId: unknown, reason: string): void {
+		if (typeof requestId !== "string" || requestId.length === 0 || requestId.length > 128) return;
+		this.sendProxy({
+			type: "task_dispatcher_proxy_result",
+			nonce: this.proxyNonce,
+			requestId,
+			result: proxyErrorResult(reason),
+		});
+	}
+
+	/** Start one parent-side nested tool call while preserving manager hooks, validation, and cancellation. */
+	private async handleProxyRequest(message: Record<string, unknown>): Promise<void> {
+		const requestId = message.requestId;
+		if (message.nonce !== this.proxyNonce) {
+			this.rejectProxyRequest(requestId, "Worker proxy request was rejected because its job nonce is invalid.");
+			return;
+		}
+		if (typeof requestId !== "string" || requestId.length === 0 || requestId.length > 128) return;
+		if (this.seenProxyRequests.has(requestId)) {
+			this.rejectProxyRequest(requestId, "Worker proxy request was rejected because its request id was replayed.");
+			return;
+		}
+		if (this.seenProxyRequests.size >= PROXY_MAX_REQUESTS_PER_JOB) {
+			this.rejectProxyRequest(requestId, "Worker proxy request was rejected because the per-job request limit was reached.");
+			return;
+		}
+		this.seenProxyRequests.add(requestId);
+		const lease = this.executorLease;
+		if (!lease || this.status !== "running") {
+			this.rejectProxyRequest(requestId, "Worker proxy request was rejected because no bounded manager executor lease is active.");
+			return;
+		}
+		if (typeof message.toolName !== "string" || message.toolName === "codemode" || !this.manifestByName.has(message.toolName)) {
+			this.rejectProxyRequest(requestId, "Worker proxy request was rejected because the requested tool is not in this job's selected capability grant.");
+			return;
+		}
+		if (this.proxyRequests.size >= PROXY_MAX_IN_FLIGHT_REQUESTS) {
+			this.rejectProxyRequest(requestId, "Worker proxy request was rejected because too many manager executions are in flight.");
+			return;
+		}
+		try {
+			this.revalidateManifest(lease.ctx);
+		} catch (error) {
+			const reason = `Delegated tool grant changed before ${message.toolName} execution: ${error instanceof Error ? error.message : String(error)}`;
+			this.rejectProxyRequest(requestId, reason);
+			void this.stop("hard_stopped", reason);
+			return;
+		}
+		let args: JsonValue;
+		try {
+			args = cloneJsonValue(message.args, `worker proxy arguments for ${message.toolName}`);
+			assertJsonByteLimit(args, `worker proxy arguments for ${message.toolName}`, PROXY_PAYLOAD_LIMIT_BYTES);
+		} catch (error) {
+			this.rejectProxyRequest(requestId, `Worker proxy request arguments are invalid: ${error instanceof Error ? error.message : String(error)}`);
+			return;
+		}
+		const controller = new AbortController();
+		const abortFromParent = () => controller.abort();
+		if (lease.signal?.aborted) controller.abort();
+		else lease.signal?.addEventListener("abort", abortFromParent, { once: true });
+		const request: ProxyRequestState = {
+			lease,
+			controller,
+			removeParentAbort: lease.signal ? () => lease.signal?.removeEventListener("abort", abortFromParent) : undefined,
+		};
+		this.proxyRequests.set(requestId, request);
+		void (async () => {
+			try {
+				const outcome = await lease.ctx.executeTool(message.toolName as string, args, {
+					signal: controller.signal,
+					onUpdate: (partial) => {
+						if (this.executorLease !== lease || this.proxyRequests.get(requestId) !== request) return;
+						this.sendProxy({
+							type: "task_dispatcher_proxy_update",
+							nonce: this.proxyNonce,
+							requestId,
+							result: serializeProxyResult(partial),
+						});
+					},
+				});
+				if (this.executorLease === lease && this.proxyRequests.get(requestId) === request) {
+					this.sendProxy({
+						type: "task_dispatcher_proxy_result",
+						nonce: this.proxyNonce,
+						requestId,
+						result: serializeProxyResult(outcome.result, outcome.isError),
+					});
+				}
+			} catch (error) {
+				if (this.executorLease === lease && this.proxyRequests.get(requestId) === request) {
+					this.sendProxy({
+						type: "task_dispatcher_proxy_result",
+						nonce: this.proxyNonce,
+						requestId,
+						result: proxyErrorResult(`Manager execution of ${message.toolName as string} failed: ${error instanceof Error ? error.message : String(error)}`),
+					});
+				}
+			} finally {
+				request.removeParentAbort?.();
+				request.removeParentAbort = undefined;
+				if (this.proxyRequests.get(requestId) === request) this.proxyRequests.delete(requestId);
+			}
+		})();
+	}
+
+	/** Propagate a child-side proxy cancellation to the current manager nested-tool signal. */
+	private handleProxyCancel(message: Record<string, unknown>): void {
+		const requestId = message.requestId;
+		if (message.nonce !== this.proxyNonce) {
+			this.rejectProxyRequest(requestId, "Worker proxy cancellation was rejected because its job nonce is invalid.");
+			return;
+		}
+		if (typeof requestId !== "string" || requestId.length === 0 || requestId.length > 128) return;
+		const request = this.proxyRequests.get(requestId);
+		if (!request || request.lease !== this.executorLease || this.status !== "running") {
+			this.rejectProxyRequest(requestId, "Worker proxy cancellation was rejected because the request is unknown or no longer active.");
+			return;
+		}
+		request.controller.abort();
+	}
+
 	/** Correlate one RPC request; an uncertain timeout closes the worker rather than permitting a racing command. */
 	private async request(label: string, payload: Record<string, unknown>, timeoutMs: number): Promise<ParsedEvent> {
 		const child = this.child;
@@ -1256,6 +1774,7 @@ class WorkerJob {
 
 	/** Reject all consumers when the worker process can no longer produce state. */
 	private failPending(error: Error): void {
+		this.clearExecutorLease();
 		for (const pending of this.pendingRequests.values()) pending.reject(error);
 		this.pendingRequests.clear();
 		this.settleWaiter?.reject(error);
@@ -1278,9 +1797,12 @@ class WorkerJob {
 
 	/** Remove runtime-only worker instructions after process termination without touching workspace artifacts. */
 	private async removeTemporaryDirectory(): Promise<void> {
+		if (this.temporaryRemoval) return await this.temporaryRemoval;
 		const directory = this.temporaryDirectory;
 		this.temporaryDirectory = undefined;
-		if (directory) await fs.promises.rm(directory, { recursive: true, force: true });
+		if (!directory) return;
+		this.temporaryRemoval = fs.promises.rm(directory, { recursive: true, force: true });
+		return await this.temporaryRemoval;
 	}
 
 	/** Coalesce token and partial-result bursts before rebuilding and serializing the complete snapshot. */
@@ -1353,20 +1875,123 @@ function resolveWorkerConfig(config: WorkerRoleConfig, ctx: ExtensionToolContext
 	};
 }
 
-/** Restrict delegations to active, non-recursive isolated-worker tools selected by the manager. */
-function validateDelegatedTools(requested: string[], pi: ExtensionAPI): string[] {
-	const tools = [...new Set(requested.map((tool) => tool.trim()).filter(Boolean))];
+/** Build exact child manifests from manager-callable tools plus the explicitly active child-local codemode. */
+function buildDelegatedToolManifests(requested: string[], pi: ExtensionAPI, ctx: ExtensionToolContext): DelegatedToolManifest[] {
+	const malformed = requested.filter((name) => name.trim() !== name || name.length === 0);
+	if (malformed.length > 0) throw new Error(`Delegated tool names must be exact nonempty names: ${malformed.join(", ")}`);
+	const duplicates = requested.filter((name, index) => requested.indexOf(name) !== index);
+	if (duplicates.length > 0) throw new Error(`Delegated tool names must not be repeated: ${[...new Set(duplicates)].join(", ")}`);
 	const forbidden = new Set([...Object.values(ROLE_TOOL_NAMES), "delegate_control", "delegate_status"]);
-	const recursive = tools.filter((tool) => forbidden.has(tool));
-	if (recursive.length > 0) throw new Error(`Delegation tools cannot be delegated: ${recursive.join(", ")}`);
+	const recursive = requested.filter((name) => forbidden.has(name));
+	if (recursive.length > 0) throw new Error(`Delegation tools cannot be delegated recursively: ${recursive.join(", ")}`);
+	if (typeof ctx.executeTool !== "function") throw new Error("The current manager tool context does not expose ctx.executeTool().");
+	const callable = new Map(ctx.tools.map((tool) => [tool.name, tool]));
+	const metadata = new Map(pi.getAllTools().map((tool) => [tool.name, tool]));
 	const active = new Set(pi.getActiveTools());
-	const unavailable = tools.filter((tool) => !active.has(tool));
-	if (unavailable.length > 0) throw new Error(`Delegated tools are not active for the manager: ${unavailable.join(", ")}`);
-	const unsupportedTools = tools.filter((tool) => !ISOLATED_WORKER_TOOLS.has(tool));
-	if (unsupportedTools.length > 0) {
-		throw new Error(`Isolated workers do not support these tools: ${unsupportedTools.join(", ")}`);
+	const unavailable = requested.filter((name) => name === "codemode"
+		? !active.has(name) || !metadata.has(name)
+		: !callable.has(name));
+	if (unavailable.length > 0) {
+		const detail = unavailable.map((name) => {
+			if (name === "codemode" && metadata.has(name)) return `${name} (registered but not active in the manager)`;
+			return metadata.has(name)
+				? `${name} (registered but not callable through ctx.executeTool())`
+				: `${name} (not registered or callable through ctx.executeTool())`;
+		});
+		throw new Error(`Requested delegated tools are unavailable: ${detail.join(", ")}`);
 	}
-	return tools;
+	const manifests = requested.map((name) => {
+		const localCodemode = name === "codemode";
+		const tool = callable.get(name);
+		const info = metadata.get(name);
+		if (!info) throw new Error(`Delegated tool ${name} does not expose registered public metadata.`);
+		const label = localCodemode ? "Codemode" : tool?.label;
+		const description = localCodemode ? info.description : tool?.description;
+		if (typeof label !== "string" || typeof description !== "string") {
+			throw new Error(`Delegated tool ${name} does not expose serializable label and description metadata.`);
+		}
+		const parameters = cloneJsonValue(localCodemode ? info.parameters : tool?.parameters, `${name} parameter schema`);
+		if (!isRecord(parameters)) throw new Error(`Delegated tool ${name} parameter schema must be a JSON object.`);
+		const outputSchema = localCodemode || tool?.outputSchema === undefined
+			? undefined
+			: cloneJsonValue(tool.outputSchema, `${name} output schema`);
+		const rawSourceInfo = info.sourceInfo;
+		if (!isRecord(rawSourceInfo)
+			|| typeof rawSourceInfo.path !== "string"
+			|| typeof rawSourceInfo.source !== "string"
+			|| !new Set(["user", "project", "temporary"]).has(rawSourceInfo.scope as string)
+			|| !new Set(["package", "top-level"]).has(rawSourceInfo.origin as string)
+			|| (rawSourceInfo.baseDir !== undefined && typeof rawSourceInfo.baseDir !== "string")) {
+			throw new Error(`Delegated tool ${name} has unsupported source metadata.`);
+		}
+		const sourceInfo = cloneJsonValue({
+			path: rawSourceInfo.path,
+			source: rawSourceInfo.source,
+			scope: rawSourceInfo.scope,
+			origin: rawSourceInfo.origin,
+			...(rawSourceInfo.baseDir === undefined ? {} : { baseDir: rawSourceInfo.baseDir }),
+		}, `${name} source metadata`);
+		let namespace: ToolNamespaceManifest | undefined;
+		if (info?.namespace !== undefined) {
+			if (!isRecord(info.namespace) || typeof info.namespace.name !== "string" || info.namespace.name.length === 0) {
+				throw new Error(`Callable tool ${name} has unsupported namespace metadata.`);
+			}
+			if (info.namespace.description !== undefined && typeof info.namespace.description !== "string") throw new Error(`Callable tool ${name} has unsupported namespace description metadata.`);
+			if (info.namespace.instructions !== undefined && typeof info.namespace.instructions !== "string") throw new Error(`Callable tool ${name} has unsupported namespace instructions metadata.`);
+			namespace = {
+				name: info.namespace.name,
+				...(info.namespace.description === undefined ? {} : { description: info.namespace.description }),
+				...(info.namespace.instructions === undefined ? {} : { instructions: info.namespace.instructions }),
+			};
+		}
+		let annotations: ToolAnnotationsManifest | undefined;
+		if (info?.annotations !== undefined) {
+			if (!isRecord(info.annotations)) throw new Error(`Callable tool ${name} has unsupported annotations metadata.`);
+			annotations = {};
+			for (const key of ["readOnlyHint", "destructiveHint", "idempotentHint", "openWorldHint"] as const) {
+				const value = info.annotations[key];
+				if (value !== undefined && typeof value !== "boolean") throw new Error(`Callable tool ${name} has unsupported ${key} metadata.`);
+				if (value !== undefined) annotations[key] = value;
+			}
+		}
+		let promptGuidelines: string[] | undefined;
+		if (info?.promptGuidelines !== undefined) {
+			if (!Array.isArray(info.promptGuidelines) || info.promptGuidelines.some((guideline) => typeof guideline !== "string")) {
+				throw new Error(`Callable tool ${name} has unsupported prompt guideline metadata.`);
+			}
+			promptGuidelines = [...info.promptGuidelines];
+		}
+		const executionMode = localCodemode ? "sequential" : tool?.executionMode;
+		if (executionMode !== undefined && executionMode !== "sequential" && executionMode !== "parallel") {
+			throw new Error(`Delegated tool ${name} has unsupported execution-mode metadata.`);
+		}
+		const comparable = cloneJsonValue({
+			name,
+			label,
+			description,
+			parameters,
+			...(outputSchema === undefined ? {} : { outputSchema }),
+			...(namespace === undefined ? {} : { namespace }),
+			...(annotations === undefined ? {} : { annotations }),
+			...(promptGuidelines === undefined ? {} : { promptGuidelines }),
+			...(executionMode === undefined ? {} : { executionMode }),
+			sourceInfo,
+		}, `${name} delegated manifest`);
+		return {
+			name,
+			label,
+			description,
+			parameters,
+			...(outputSchema === undefined ? {} : { outputSchema }),
+			...(namespace === undefined ? {} : { namespace }),
+			...(annotations === undefined ? {} : { annotations }),
+			...(promptGuidelines === undefined ? {} : { promptGuidelines }),
+			...(executionMode === undefined ? {} : { executionMode }),
+			fingerprint: stableJson(comparable),
+		};
+	});
+	assertJsonByteLimit(manifests as unknown as JsonValue, "delegated tool manifest", PROXY_MANIFEST_LIMIT_BYTES);
+	return manifests;
 }
 
 /** Format context pressure against the worker model's own physical context window. */
@@ -1673,7 +2298,7 @@ function registerDelegate(pi: ExtensionAPI, role: Role): void {
 		renderResult(result, { expanded, isPartial }, theme, context) {
 			return renderWorkerResult(result as any, expanded, isPartial, theme, context);
 		},
-		async execute(_toolCallId, params, signal, onUpdate, ctx) {
+		async execute(toolCallId, params, signal, onUpdate, ctx) {
 			try {
 				if (activeJob && !isTerminal(activeJob.status)) throw new Error(`${activeJob.id} is still ${activeJob.status}.`);
 				if (activeJob) {
@@ -1681,16 +2306,16 @@ function registerDelegate(pi: ExtensionAPI, role: Role): void {
 					activeJob = undefined;
 				}
 				const config = loadConfig();
-				const tools = validateDelegatedTools(params.tools, pi);
+				const manifests = buildDelegatedToolManifests(params.tools, pi, ctx);
 				const resolved = resolveWorkerConfig(config[role], ctx);
 				const budget = calculateBudget(role, params.workload, resolved.contextWindow, resolved.maxTokens, config.policy);
-				const job = new WorkerJob(role, params.task, tools, resolved.role, ctx.cwd, config.policy, budget);
+				const job = new WorkerJob(role, params.task, manifests, resolved.role, ctx.cwd, config.policy, budget, pi, ctx.tools);
 				activeJob = job;
 				const progress = (snapshot: WorkerSnapshot) => {
 					updateWorkerStatus(ctx, snapshot);
 					onUpdate?.({ content: [{ type: "text", text: formatSnapshot(snapshot) }], details: snapshot });
 				};
-				const snapshot = await job.start(signal, progress);
+				const snapshot = await job.start(toolCallId, signal, progress, ctx);
 				updateWorkerStatus(ctx, snapshot);
 				return snapshotResult(snapshot, snapshot.status === "failed" || snapshot.status === "hard_stopped");
 			} catch (error) {
@@ -1734,7 +2359,7 @@ function registerControl(pi: ExtensionAPI): void {
 		renderResult(result, { expanded, isPartial }, theme, context) {
 			return renderWorkerResult(result as any, expanded, isPartial, theme, context);
 		},
-		async execute(_toolCallId, params, signal, onUpdate, ctx) {
+		async execute(toolCallId, params, signal, onUpdate, ctx) {
 			try {
 				const job = activeJob;
 				if (!job || job.id !== params.jobId) throw new Error(`No live delegation matches ${params.jobId}.`);
@@ -1757,7 +2382,7 @@ function registerControl(pi: ExtensionAPI): void {
 						updateWorkerStatus(ctx, state);
 						onUpdate?.({ content: [{ type: "text", text: formatSnapshot(state) }], details: state });
 					};
-					snapshot = await job.continue(params.action === "revise" ? params.instructions : undefined, params.actionBatches ?? 1, signal, progress);
+					snapshot = await job.continue(params.action === "revise" ? params.instructions : undefined, params.actionBatches ?? 1, toolCallId, signal, progress, ctx);
 				}
 				snapshot.managerAction = params.action;
 				updateWorkerStatus(ctx, snapshot);
@@ -1807,8 +2432,13 @@ export default function taskDispatcher(pi: ExtensionAPI): void {
 	for (const role of ROLES) registerDelegate(pi, role);
 	registerControl(pi);
 	registerStatus(pi);
+	pi.on("tool_call", (event) => activeJob
+		? activeJob.authorizeNestedToolCall(event.toolCallId, event.parentToolCallId, event.toolName)
+		: revokedExecutorDecision(event.parentToolCallId, event.toolName));
 	pi.on("session_shutdown", async () => {
 		if (activeJob) await activeJob.dispose();
 		activeJob = undefined;
+		revokedExecutorRoots.clear();
+		revokedExecutorGuardSaturated = false;
 	});
 }
