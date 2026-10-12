@@ -104,7 +104,6 @@ interface WorkerAction {
 
 /** Keep one replaceable presentation record for each assistant response or child tool lifecycle. */
 interface WorkerPresentationEntry {
-	sequence: number;
 	id: string;
 	kind: "assistant" | "tool";
 	label: string;
@@ -253,7 +252,6 @@ interface ProxyWireResult {
 }
 
 interface ExecutorLease {
-	generation: number;
 	rootToolCallId: string;
 	ctx: ExtensionToolContext;
 	signal: AbortSignal | undefined;
@@ -880,7 +878,7 @@ class WorkerJob {
 	private requestSequence = 0;
 	private actionSequence = 0;
 	private completionSequence = 0;
-	private presentationSequence = 0;
+	private assistantIdSequence = 0;
 	private readonly presentationEntries: WorkerPresentationEntry[] = [];
 	private readonly presentationById = new Map<string, WorkerPresentationEntry>();
 	private readonly assistantTextBlocks = new Map<number, string>();
@@ -899,7 +897,6 @@ class WorkerJob {
 	private pausedLease: ReturnType<typeof setTimeout> | undefined;
 	private closePromise: Promise<void> | undefined;
 	private executorLease: ExecutorLease | undefined;
-	private executorLeaseSequence = 0;
 	private readonly proxyRequests = new Map<string, ProxyRequestState>();
 	private readonly seenProxyRequests = new Set<string>();
 
@@ -1315,8 +1312,7 @@ class WorkerJob {
 		if (this.activeAssistantPresentation) return this.activeAssistantPresentation;
 		this.assistantTextBlocks.clear();
 		const entry: WorkerPresentationEntry = {
-			sequence: ++this.presentationSequence,
-			id: `assistant-${this.presentationSequence}`,
+			id: `assistant-${++this.assistantIdSequence}`,
 			kind: "assistant",
 			label: "assistant",
 			status: "streaming",
@@ -1365,7 +1361,6 @@ class WorkerJob {
 		if (existing) return existing;
 		const action = this.activeActions.get(toolCallId);
 		const entry: WorkerPresentationEntry = {
-			sequence: ++this.presentationSequence,
 			id,
 			kind: "tool",
 			label: action?.label ?? formatActivity(toolName, args),
@@ -1580,7 +1575,7 @@ class WorkerJob {
 	}
 
 	/** Enforce selected capabilities during a lease and reject delayed calls from every revoked lease. */
-	authorizeNestedToolCall(_toolCallId: string, parentToolCallId: string | undefined, toolName: string): { block: boolean; reason: string } | undefined {
+	authorizeNestedToolCall(parentToolCallId: string | undefined, toolName: string): { block: boolean; reason: string } | undefined {
 		if (!parentToolCallId) return undefined;
 		const lease = this.executorLease;
 		if (lease && (parentToolCallId === lease.rootToolCallId || parentToolCallId.startsWith(`${lease.rootToolCallId}/`))) {
@@ -1595,7 +1590,7 @@ class WorkerJob {
 	/** Grant parent execution only while a start or continuation call actively owns the worker. */
 	private openExecutorLease(rootToolCallId: string, ctx: ExtensionToolContext, signal: AbortSignal | undefined): ExecutorLease {
 		if (this.executorLease) throw new Error("A manager executor lease is already active for this worker.");
-		const lease: ExecutorLease = { generation: ++this.executorLeaseSequence, rootToolCallId, ctx, signal };
+		const lease: ExecutorLease = { rootToolCallId, ctx, signal };
 		this.executorLease = lease;
 		return lease;
 	}
@@ -1692,43 +1687,41 @@ class WorkerJob {
 			removeParentAbort: lease.signal ? () => lease.signal?.removeEventListener("abort", abortFromParent) : undefined,
 		};
 		this.proxyRequests.set(requestId, request);
-		void (async () => {
-			try {
-				const outcome = await lease.ctx.executeTool(message.toolName as string, args, {
-					signal: controller.signal,
-					onUpdate: (partial) => {
-						if (this.executorLease !== lease || this.proxyRequests.get(requestId) !== request) return;
-						this.sendProxy({
-							type: "task_dispatcher_proxy_update",
-							nonce: this.proxyNonce,
-							requestId,
-							result: serializeProxyResult(partial),
-						});
-					},
+		try {
+			const outcome = await lease.ctx.executeTool(message.toolName as string, args, {
+				signal: controller.signal,
+				onUpdate: (partial) => {
+					if (this.executorLease !== lease || this.proxyRequests.get(requestId) !== request) return;
+					this.sendProxy({
+						type: "task_dispatcher_proxy_update",
+						nonce: this.proxyNonce,
+						requestId,
+						result: serializeProxyResult(partial),
+					});
+				},
+			});
+			if (this.executorLease === lease && this.proxyRequests.get(requestId) === request) {
+				this.sendProxy({
+					type: "task_dispatcher_proxy_result",
+					nonce: this.proxyNonce,
+					requestId,
+					result: serializeProxyResult(outcome.result, outcome.isError),
 				});
-				if (this.executorLease === lease && this.proxyRequests.get(requestId) === request) {
-					this.sendProxy({
-						type: "task_dispatcher_proxy_result",
-						nonce: this.proxyNonce,
-						requestId,
-						result: serializeProxyResult(outcome.result, outcome.isError),
-					});
-				}
-			} catch (error) {
-				if (this.executorLease === lease && this.proxyRequests.get(requestId) === request) {
-					this.sendProxy({
-						type: "task_dispatcher_proxy_result",
-						nonce: this.proxyNonce,
-						requestId,
-						result: proxyErrorResult(`Manager execution of ${message.toolName as string} failed: ${error instanceof Error ? error.message : String(error)}`),
-					});
-				}
-			} finally {
-				request.removeParentAbort?.();
-				request.removeParentAbort = undefined;
-				if (this.proxyRequests.get(requestId) === request) this.proxyRequests.delete(requestId);
 			}
-		})();
+		} catch (error) {
+			if (this.executorLease === lease && this.proxyRequests.get(requestId) === request) {
+				this.sendProxy({
+					type: "task_dispatcher_proxy_result",
+					nonce: this.proxyNonce,
+					requestId,
+					result: proxyErrorResult(`Manager execution of ${message.toolName as string} failed: ${error instanceof Error ? error.message : String(error)}`),
+				});
+			}
+		} finally {
+			request.removeParentAbort?.();
+			request.removeParentAbort = undefined;
+			if (this.proxyRequests.get(requestId) === request) this.proxyRequests.delete(requestId);
+		}
 	}
 
 	/** Propagate a child-side proxy cancellation to the current manager nested-tool signal. */
@@ -1851,7 +1844,7 @@ class WorkerJob {
 let activeJob: WorkerJob | undefined;
 let lastSnapshot: WorkerSnapshot | undefined;
 const latestRoleSnapshots = new Map<Role, WorkerSnapshot>();
-const reportedUsage = new Map<string, UsageTotals>();
+let reportedUsage: { jobId: string; usage: UsageTotals } | undefined;
 
 /** Resolve role overrides against the active parent model without assuming provider availability. */
 function resolveWorkerConfig(config: WorkerRoleConfig, ctx: ExtensionToolContext): { role: ResolvedWorkerRoleConfig; contextWindow: number; maxTokens: number } {
@@ -1965,7 +1958,7 @@ function buildDelegatedToolManifests(requested: string[], pi: ExtensionAPI, ctx:
 		if (executionMode !== undefined && executionMode !== "sequential" && executionMode !== "parallel") {
 			throw new Error(`Delegated tool ${name} has unsupported execution-mode metadata.`);
 		}
-		const comparable = cloneJsonValue({
+		const manifest: Omit<DelegatedToolManifest, "fingerprint"> = {
 			name,
 			label,
 			description,
@@ -1975,19 +1968,10 @@ function buildDelegatedToolManifests(requested: string[], pi: ExtensionAPI, ctx:
 			...(annotations === undefined ? {} : { annotations }),
 			...(promptGuidelines === undefined ? {} : { promptGuidelines }),
 			...(executionMode === undefined ? {} : { executionMode }),
-			sourceInfo,
-		}, `${name} delegated manifest`);
+		};
 		return {
-			name,
-			label,
-			description,
-			parameters,
-			...(outputSchema === undefined ? {} : { outputSchema }),
-			...(namespace === undefined ? {} : { namespace }),
-			...(annotations === undefined ? {} : { annotations }),
-			...(promptGuidelines === undefined ? {} : { promptGuidelines }),
-			...(executionMode === undefined ? {} : { executionMode }),
-			fingerprint: stableJson(comparable),
+			...manifest,
+			fingerprint: stableJson(cloneJsonValue({ ...manifest, sourceInfo }, `${name} delegated manifest`)),
 		};
 	});
 	assertJsonByteLimit(manifests as unknown as JsonValue, "delegated tool manifest", PROXY_MANIFEST_LIMIT_BYTES);
@@ -2246,12 +2230,11 @@ function renderWorkerResult(
 /** Package a snapshot as bounded model content plus complete machine-readable details. */
 function snapshotResult(snapshot: WorkerSnapshot, isError = false): { content: Array<{ type: "text"; text: string }>; details: WorkerSnapshot; usage: UsageTotals; isError: boolean } {
 	lastSnapshot = snapshot;
-	for (const jobId of reportedUsage.keys()) {
-		if (jobId !== snapshot.jobId) reportedUsage.delete(jobId);
-	}
-	const previous = reportedUsage.get(snapshot.jobId) ?? emptyUsage();
+	const previous = reportedUsage && reportedUsage.jobId === snapshot.jobId
+		? reportedUsage.usage
+		: emptyUsage();
 	const usage = usageDifference(snapshot.usage, previous);
-	reportedUsage.set(snapshot.jobId, structuredClone(snapshot.usage));
+	reportedUsage = { jobId: snapshot.jobId, usage: structuredClone(snapshot.usage) };
 	return {
 		content: [{ type: "text", text: formatSnapshot(snapshot) }],
 		details: snapshot,
@@ -2433,7 +2416,7 @@ export default function taskDispatcher(pi: ExtensionAPI): void {
 	registerControl(pi);
 	registerStatus(pi);
 	pi.on("tool_call", (event) => activeJob
-		? activeJob.authorizeNestedToolCall(event.toolCallId, event.parentToolCallId, event.toolName)
+		? activeJob.authorizeNestedToolCall(event.parentToolCallId, event.toolName)
 		: revokedExecutorDecision(event.parentToolCallId, event.toolName));
 	pi.on("session_shutdown", async () => {
 		if (activeJob) await activeJob.dispose();
