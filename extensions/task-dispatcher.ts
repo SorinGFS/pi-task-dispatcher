@@ -220,6 +220,7 @@ interface ToolNamespaceManifest {
 	name: string;
 	description?: string;
 	instructions?: string;
+	aliases?: string[];
 }
 
 interface ToolAnnotationsManifest {
@@ -363,6 +364,18 @@ const ControlParams = Type.Object({
 const StatusParams = Type.Object({
 	jobId: Type.Optional(Type.String({ minLength: 1 })),
 });
+
+/** Return only an exact nonrecursive tool list for Pi's pre-execution reachability check. */
+function exactDelegatedReachability(input: unknown): readonly string[] {
+	if (!isRecord(input) || !Array.isArray(input.tools) || input.tools.length > 32) return [];
+	const forbidden = new Set([...Object.values(ROLE_TOOL_NAMES), "delegate_control", "delegate_status"]);
+	const grant: string[] = [];
+	for (const name of input.tools) {
+		if (typeof name !== "string" || name.length === 0 || name.trim() !== name || forbidden.has(name) || grant.includes(name)) return [];
+		grant.push(name);
+	}
+	return grant;
+}
 
 /** Identify plain objects before reading configuration and RPC data. */
 function isRecord(value: unknown): value is Record<string, unknown> {
@@ -680,7 +693,7 @@ type ProxyTool = {
 	description: string;
 	parameters: Record<string, unknown>;
 	outputSchema?: unknown;
-	namespace?: { name: string; description?: string; instructions?: string };
+	namespace?: { name: string; description?: string; instructions?: string; aliases?: string[] };
 	annotations?: { readOnlyHint?: boolean; destructiveHint?: boolean; idempotentHint?: boolean; openWorldHint?: boolean };
 	promptGuidelines?: string[];
 	executionMode?: "sequential" | "parallel";
@@ -1842,6 +1855,15 @@ class WorkerJob {
 }
 
 let activeJob: WorkerJob | undefined;
+
+/** Return a paused job's exact fixed grant only for controls that can resume that job. */
+function continuationDelegatedReachability(input: unknown): readonly string[] {
+	if (!isRecord(input) || (input.action !== "continue" && input.action !== "revise") || typeof input.jobId !== "string") return [];
+	const job = activeJob;
+	if (!job || job.id !== input.jobId || job.status !== "paused") return [];
+	return [...job.tools];
+}
+
 let lastSnapshot: WorkerSnapshot | undefined;
 const latestRoleSnapshots = new Map<Role, WorkerSnapshot>();
 let reportedUsage: { jobId: string; usage: UsageTotals } | undefined;
@@ -1926,15 +1948,26 @@ function buildDelegatedToolManifests(requested: string[], pi: ExtensionAPI, ctx:
 		}, `${name} source metadata`);
 		let namespace: ToolNamespaceManifest | undefined;
 		if (info?.namespace !== undefined) {
-			if (!isRecord(info.namespace) || typeof info.namespace.name !== "string" || info.namespace.name.length === 0) {
+			const rawNamespace = info.namespace;
+			if (!isRecord(rawNamespace) || typeof rawNamespace.name !== "string" || rawNamespace.name.length === 0) {
 				throw new Error(`Callable tool ${name} has unsupported namespace metadata.`);
 			}
-			if (info.namespace.description !== undefined && typeof info.namespace.description !== "string") throw new Error(`Callable tool ${name} has unsupported namespace description metadata.`);
-			if (info.namespace.instructions !== undefined && typeof info.namespace.instructions !== "string") throw new Error(`Callable tool ${name} has unsupported namespace instructions metadata.`);
+			if (rawNamespace.description !== undefined && typeof rawNamespace.description !== "string") throw new Error(`Callable tool ${name} has unsupported namespace description metadata.`);
+			if (rawNamespace.instructions !== undefined && typeof rawNamespace.instructions !== "string") throw new Error(`Callable tool ${name} has unsupported namespace instructions metadata.`);
+			const rawAliases = rawNamespace.aliases;
+			let aliases: string[] | undefined;
+			if (rawAliases !== undefined) {
+				if (!Array.isArray(rawAliases)) throw new Error(`Callable tool ${name} has unsupported namespace aliases metadata.`);
+				aliases = rawAliases.map((alias) => {
+					if (typeof alias !== "string") throw new Error(`Callable tool ${name} has unsupported namespace aliases metadata.`);
+					return alias;
+				});
+			}
 			namespace = {
-				name: info.namespace.name,
-				...(info.namespace.description === undefined ? {} : { description: info.namespace.description }),
-				...(info.namespace.instructions === undefined ? {} : { instructions: info.namespace.instructions }),
+				name: rawNamespace.name,
+				...(rawNamespace.description === undefined ? {} : { description: rawNamespace.description }),
+				...(rawNamespace.instructions === undefined ? {} : { instructions: rawNamespace.instructions }),
+				...(aliases === undefined ? {} : { aliases }),
 			};
 		}
 		let annotations: ToolAnnotationsManifest | undefined;
@@ -1971,6 +2004,7 @@ function buildDelegatedToolManifests(requested: string[], pi: ExtensionAPI, ctx:
 		};
 		return {
 			...manifest,
+			// Preserve namespace aliases in the immutable compatibility surface checked before every resume.
 			fingerprint: stableJson(cloneJsonValue({ ...manifest, sourceInfo }, `${name} delegated manifest`)),
 		};
 	});
@@ -2260,6 +2294,8 @@ function registerDelegate(pi: ExtensionAPI, role: Role): void {
 			"Inspect every paused state and choose continue, revise, recalculate, compact, checkpoint, cancel, or take over.",
 			"Worker reports remain evidence to review, not proof of correctness.",
 		],
+		// Advertise the validated child grant to Pi without serializing a reachability callback into a proxy manifest.
+		...{ reachesTools: exactDelegatedReachability },
 		parameters: DelegateParams,
 		exposure: "model-only",
 		executionMode: "sequential",
@@ -2323,6 +2359,8 @@ function registerControl(pi: ExtensionAPI): void {
 		description: "Control one paused supervised worker: continue, revise, recalculate, compact, take over, checkpoint, cancel.",
 		promptSnippet: "delegate_control: make an explicit manager decision for a paused delegation",
 		promptGuidelines: ["Use only after inspecting the latest worker boundary state.", "Takeover, cancellation, and ceilings are enforced by the dispatcher rather than worker compliance."],
+		// Tie continuation reachability to the live paused job rather than a broader role or historical grant.
+		...{ reachesTools: continuationDelegatedReachability },
 		parameters: ControlParams,
 		exposure: "model-only",
 		executionMode: "sequential",

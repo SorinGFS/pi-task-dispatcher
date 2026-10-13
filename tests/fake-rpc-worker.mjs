@@ -131,8 +131,16 @@ async function validateFirstPrompt() {
 			throw new Error("native codemode-only extension or selected proxy visibility was incorrect");
 		}
 	}
-	if (scenario === "extension" && proxyNames.join(",") !== "extension_tool") {
-		throw new Error(`extension tool proxy visibility was not exact: ${proxyNames.join(",")}`);
+	if (scenario === "extension") {
+		// Prove namespace aliases cross the JSON-only manifest while reachability callbacks stay parent-local.
+		const [extensionTool] = proxyConfiguration.tools;
+		if (
+			proxyNames.join(",") !== "extension_tool"
+			|| JSON.stringify(extensionTool?.namespace?.aliases) !== JSON.stringify(["extension-alias", "manager-extension"])
+			|| Object.hasOwn(extensionTool ?? {}, "reachesTools")
+		) {
+			throw new Error(`extension tool proxy metadata was not exact: ${proxyNames.join(",")}`);
+		}
 	}
 	if (scenario === "transitive" && proxyNames.join(",") !== "extension_tool,read") {
 		throw new Error(`transitive tool proxy visibility was not exact: ${proxyNames.join(",")}`);

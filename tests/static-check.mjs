@@ -68,7 +68,7 @@ for (const required of [
 	if (!source.includes(required)) throw new Error(`Missing supervised-protocol marker: ${required}`);
 }
 
-if (packageJson.version !== "3.2.0") throw new Error(`Expected release version 3.2.0, found ${packageJson.version}`);
+if (packageJson.version !== "3.2.2") throw new Error(`Expected release version 3.2.2, found ${packageJson.version}`);
 // Keep test-side RPC framing independent from readline's broader line-separator behavior.
 for (const [name, reader] of [["fake RPC worker", fakeRpcWorker], ["gate probe", gateProbe]]) {
 	if (reader.includes("node:readline")) throw new Error(`${name} still imports node:readline.`);

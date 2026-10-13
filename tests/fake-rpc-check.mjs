@@ -110,7 +110,7 @@ try {
 		name: entry.name,
 		description: entry.description,
 		parameters: entry.parameters,
-		namespace: entry.name === "extension_tool" ? { name: "extension", description: "Manager extension namespace", instructions: "Use exact manager arguments." } : undefined,
+		namespace: entry.name === "extension_tool" ? { name: "extension", description: "Manager extension namespace", instructions: "Use exact manager arguments.", aliases: ["extension-alias", "manager-extension"] } : undefined,
 		annotations: entry.annotations,
 		promptGuidelines: [`${entry.name} is controlled by the manager.`],
 		sourceInfo: { path: `<fake:${entry.name}>`, source: "fake", scope: "temporary", origin: "top-level", baseDir: undefined },
@@ -203,6 +203,16 @@ try {
 	const designerStart = registeredTools.get("delegate_designer");
 	const control = registeredTools.get("delegate_control");
 	assert(start && designerStart && control, "Expected supervised tools to register.");
+	// Pi 1.2 must see only the exact requested grant, never a broad or recursive delegation surface.
+	assert.equal(typeof start.reachesTools, "function", "Delegation starts must expose reachability metadata.");
+	const requestedReachability = ["read", "codemode"];
+	const advertisedReachability = start.reachesTools({ tools: requestedReachability });
+	assert.deepEqual(advertisedReachability, requestedReachability);
+	assert.notStrictEqual(advertisedReachability, requestedReachability, "Reachability must not expose the caller's mutable tool array.");
+	assert.deepEqual(start.reachesTools({ tools: ["read", "delegate_control"] }), []);
+	assert.deepEqual(start.reachesTools({ tools: ["read", "read"] }), []);
+	assert.equal(typeof control.reachesTools, "function", "Delegation controls must expose reachability metadata.");
+	assert.deepEqual(control.reachesTools({ jobId: "missing", action: "continue" }), []);
 	assert(registeredTools.has("delegate_mechanical") && registeredTools.has("delegate_assistant"), "Expected every worker role to register.");
 	const schemaGuidance = registeredTools.get("delegate_mechanical").parameters.properties.tools.description;
 	assert.match(schemaGuidance, /codemode.*allowlist.*direct tool.*otherwise omit/i, "Schema guidance no longer describes the codemode delegation rule.");
@@ -244,6 +254,10 @@ try {
 	for (let index = 0; index < 100; index++) assert.equal(start.renderResult(result, { expanded: false, isPartial: false }, theme, renderContext).render(100).join("\n"), firstRender);
 	assert.equal(rendererInvalidations, 0, "A renderer invalidated its own render pass.");
 	const normalJobId = result.details.jobId;
+	// Only matching continue/revise controls inherit the paused worker's exact grant.
+	assert.deepEqual(control.reachesTools({ jobId: normalJobId, action: "continue" }), ["read"]);
+	assert.deepEqual(control.reachesTools({ jobId: normalJobId, action: "revise", instructions: "keep scope" }), ["read"]);
+	assert.deepEqual(control.reachesTools({ jobId: normalJobId, action: "compact" }), []);
 	const managerArgs = { jobId: normalJobId, action: "continue", actionBatches: 1 };
 	const managerRenderContext = { args: managerArgs, state: {}, invalidate() { rendererInvalidations++; }, cwd: projectRoot };
 	assert.match(control.renderCall(managerArgs, theme, managerRenderContext).render(100).join("\n"), /manager: engineer-1 → continue/);
@@ -254,6 +268,7 @@ try {
 	assert.equal(result.details.workerText, "deterministic worker complete");
 	assert.equal(result.usage.input, 5, "Continuation must return only newly observed usage.");
 	assert.equal(result.usage.totalTokens, 8);
+	assert.deepEqual(control.reachesTools({ jobId: normalJobId, action: "continue" }), []);
 
 	// Codemode remains local while only the manager-selected non-codemode capability is proxied.
 	await writeFile(configPath, JSON.stringify({ designer: { model: "media-provider/media-model", thinking: "high" } }), "utf8");
@@ -379,6 +394,22 @@ try {
 	assert.equal(identityRevalidated.details.status, "hard_stopped");
 	assert.match(identityRevalidated.content[0].text, /original callable identity/i);
 	managerTools[readIndex] = originalReadTool;
+
+	// Namespace aliases are copied into the proxy manifest and must participate in continuation fingerprints.
+	const extensionMetadata = managerMetadata.find((entry) => entry.name === "extension_tool");
+	assert(extensionMetadata?.namespace, "Expected extension namespace metadata.");
+	const originalExtensionAliases = extensionMetadata.namespace.aliases;
+	result = await start.execute("start-revalidate-aliases", { task: "revalidate namespace aliases", tools: ["extension_tool"], workload }, undefined, undefined, context);
+	extensionMetadata.namespace.aliases = [...originalExtensionAliases, "changed-alias"];
+	const aliasesRevalidated = await control.execute("continue-revalidate-aliases", { jobId: result.details.jobId, action: "continue", actionBatches: 1 }, undefined, undefined, context);
+	assert.equal(aliasesRevalidated.isError, true);
+	assert.equal(aliasesRevalidated.details.status, "hard_stopped");
+	assert.match(aliasesRevalidated.content[0].text, /manifest revalidation failed/i);
+	extensionMetadata.namespace.aliases = ["extension-alias", 7];
+	result = await start.execute("start-invalid-aliases", { task: "reject invalid namespace aliases", tools: ["extension_tool"], workload }, undefined, undefined, context);
+	assert.equal(result.isError, true);
+	assert.match(result.content[0].text, /unsupported namespace aliases metadata/i);
+	extensionMetadata.namespace.aliases = originalExtensionAliases;
 
 	// Revalidate again at execution time so a replacement during an active lease cannot win a race.
 	await clearObservations();

@@ -1,6 +1,6 @@
 {
   "name": "pi-task-dispatcher",
-  "version": "3.2.1",
+  "version": "3.2.2",
   "description": "Run configurable Pi worker models as supervised, observable, resumable jobs.",
   "type": "module",
   "keywords": [
